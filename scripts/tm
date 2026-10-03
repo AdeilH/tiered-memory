@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# tm — temporary tiered-memory runner for testing.
+#
+# Nothing is installed and nothing leaks:
+#   · binary is built into the repo's target/ and invoked BY PATH
+#     (a child process can't export into your shell, so we never rely on PATH)
+#   · data lives in a scratch dir, never in ~/tiered-memory
+#   · `scripts/tm clean` wipes the scratch data; deleting the repo deletes all
+#
+# Usage:
+#   scripts/tm <subcommand> [args…]   # same subcommands as tiered-memory
+#   scripts/tm env                    # print exports for `eval "$(scripts/tm env)"`
+#   scripts/tm clean                  # remove the test data dir
+#
+# If you truly want it on PATH in your current shell:
+#   eval "$(scripts/tm env)"
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$REPO_DIR/target/release/tiered-memory"
+DATA_DIR="${TM_DATA_DIR:-${TMPDIR:-/tmp}/tiered-memory-test}"
+
+# build on demand (skipped when the binary already exists)
+if [[ ! -x "$BIN" ]]; then
+  echo "tm: building tiered-memory (release)…" >&2
+  (cd "$REPO_DIR" && cargo build --release) >&2
+fi
+
+cmd="${1:-help}"
+if [[ $# -gt 0 ]]; then shift; fi
+
+case "$cmd" in
+  env)
+    # emit-and-eval: the shell, not this process, applies these
+    printf 'export PATH=%q:$PATH\n' "$(dirname "$BIN")"
+    printf 'export TM_DATA_DIR=%q\n' "$DATA_DIR"
+    ;;
+  clean)
+    rm -rf "$DATA_DIR"
+    echo "tm: removed $DATA_DIR"
+    ;;
+  serve)
+    TM_DATA_DIR="$DATA_DIR" exec "$BIN" serve "$@"
+    ;;
+  help)
+    TM_DATA_DIR="$DATA_DIR" "$BIN" help
+    echo
+    echo "tm wrapper: data dir $DATA_DIR (scripts/tm clean to wipe)"
+    echo "  scripts/tm env    → exports for eval   ·   scripts/tm clean → wipe test data"
+    ;;
+  *)
+    TM_DATA_DIR="$DATA_DIR" "$BIN" "$cmd" "$@"
+    ;;
+esac

@@ -43,6 +43,7 @@ async fn main() {
         Some("credentials") => credentials(),
         Some("models") => models(),
         Some("install-skill") => install_skill(),
+        Some("env") => print_env(),
         Some("stats") => stats(),
         Some("help") | Some("--help") | Some("-h") => {
             print_usage();
@@ -88,6 +89,9 @@ USAGE:
   tiered-memory models                   list the configured provider's models
   tiered-memory install-skill [--dir D]   install the /tiered-memory agent skill
                                          (default dir: ~/.agents/skills)
+  tiered-memory env                      print exports for `eval \"$(tiered-memory env)\"`
+                                         (PATH + TM_DATA_DIR; a process cannot
+                                         export into its parent shell itself)
   tiered-memory stats   [--user U]       per-layer counts vs capacity
 
 Non-Rust projects use the installed binary two ways: HTTP (serve + any client)
@@ -999,6 +1003,29 @@ fn install_skill() -> Result<(), String> {
     println!("skill installed: {}", path.display());
     println!("the `/tiered-memory` skill is now available to harnesses that load ~/.agents/skills (restart/refresh the harness if it caches its skill list)");
     Ok(())
+}
+
+// -- env ---------------------------------------------------------------------
+
+/// `tiered-memory env` — emit-and-eval exports.
+///
+/// A process cannot modify its parent shell's environment (the env is copied
+/// at fork and never propagated back), so instead of exporting, this prints
+/// shell code the caller applies with `eval "$(tiered-memory env)"` — the
+/// same pattern used by direnv-style tools. Prints the binary's own directory
+/// for PATH (found via /proc self-exe, not $0) and the resolved data dir.
+fn print_env() -> Result<(), String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            println!("export PATH={}:$PATH", shell_quote(&dir.to_string_lossy()));
+        }
+    }
+    println!("export TM_DATA_DIR={}", shell_quote(&data_root().to_string_lossy()));
+    Ok(())
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 // -- stats -------------------------------------------------------------------
