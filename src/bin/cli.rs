@@ -240,6 +240,17 @@ async fn serve() -> Result<(), String> {
         "no token (loopback only)"
     };
 
+    // Safety rail (docs/SECURITY_ANALYSIS.md M5): a non-loopback bind turns
+    // the service into a network API — require a token, or an explicit opt-out.
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(&bind);
+    let loopback = matches!(host, "" | "127.0.0.1" | "localhost" | "::1" | "[::1]");
+    if !loopback && token.is_none() && std::env::var("TM_ALLOW_INSECURE").as_deref() != Ok("1") {
+        return Err(format!(
+            "refusing to bind non-loopback address `{bind}` without auth — write a secret to {} (Bearer token) or set TM_ALLOW_INSECURE=1 to override",
+            root.join("token").display()
+        ));
+    }
+
     let health = engine.health();
     let app = tiered_memory::build_router(Arc::new(ServerState {
         engine: engine.clone(),
