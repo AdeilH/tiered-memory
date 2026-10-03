@@ -64,9 +64,11 @@ fn print_usage() {
 
 USAGE:
   tiered-memory serve                    start the HTTP service on {DEFAULT_BIND}
-  tiered-memory init [--name N] [--id ID] [--descriptor T] [--user U]
-                                         register THIS directory as a project
-                                         (writes ./tiered-memory.json)
+  tiered-memory init [--name N] [--id ID] [--descriptor T] [--user U] [--gitignore]
+                                         register THIS directory as a project;
+                                         shows full paths and offers to gitignore
+                                         the marker file (scripts: --gitignore
+                                         pre-answers yes)
   tiered-memory projects [--user U]      list projects using tiered memory
   tiered-memory select  [--user U] [--project P]
                                          pick the current project (interactive without P)
@@ -355,12 +357,64 @@ fn init() -> Result<(), String> {
         println!("  ({detected_name} → {project_id})");
     }
     println!("wrote {}", config_path.display());
+    println!("memory data: {}", data_root().display());
+
+    // offer to keep the marker out of version control (dev-phase projects
+    // link tiered-memory temporarily, so the default is yes)
+    let gitignore = cwd.join(".gitignore");
+    let want_ignore = if arg_switch(&args, "--gitignore") {
+        true
+    } else if crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
+        print!("\nadd tiered-memory.json to .gitignore? [Y/n] ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        let t = line.trim().to_ascii_lowercase();
+        !matches!(t.as_str(), "n" | "no")
+    } else {
+        println!(
+            "hint: add tiered-memory.json to .gitignore if you don't want it tracked (or re-run init with --gitignore)"
+        );
+        false
+    };
+    if want_ignore {
+        match append_gitignore(&gitignore, "tiered-memory.json") {
+            Ok(true) => println!("added to {}", gitignore.display()),
+            Ok(false) => println!("already in {}", gitignore.display()),
+            Err(e) => println!("could not update .gitignore: {e}"),
+        }
+    }
+
     println!("\nnext:");
     println!("  tiered-memory remember \"prefers analogies from games\" --project {project_id}");
     println!("  tiered-memory recall \"how should I explain recursion?\" --project {project_id}");
     println!("  tiered-memory params --project {project_id}");
     println!("anywhere in this project: tiered-memory select --project {project_id}");
     Ok(())
+}
+
+/// Append `entry` to a `.gitignore`, creating it if needed. Returns false when
+/// the entry is already present (idempotent re-inits don't duplicate lines).
+fn append_gitignore(path: &Path, entry: &str) -> Result<bool, String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == entry) {
+        return Ok(false);
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("# tiered-memory\n");
+    out.push_str(entry);
+    out.push('\n');
+    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(true)
 }
 
 /// (name, description) for the project at `dir`, best-effort.

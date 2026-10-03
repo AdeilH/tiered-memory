@@ -42,7 +42,9 @@ store — and writes a discovery file:
 
 Host code reads that file (or the CLI resolves it automatically) so no project
 has to hard-code its project id. Re-run `init` any time to update name or
-descriptor; `--name`, `--id`, `--descriptor` override detection.
+descriptor; `--name`, `--id`, `--descriptor` override detection. `init` prints
+the full paths (marker + data dir) and asks to add `tiered-memory.json` to
+`.gitignore` (Enter = yes; `--gitignore` pre-answers in scripts).
 
 ## Running the service
 

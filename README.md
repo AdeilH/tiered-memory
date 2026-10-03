@@ -72,7 +72,9 @@ tiered-memory init
 
 It detects the project (package.json / Cargo.toml / pyproject.toml / dir
 name), registers it, and writes a `tiered-memory.json` marker so every later
-command resolves the project automatically.
+command resolves the project automatically. It shows the full paths (marker +
+memory data dir) and asks whether to add the marker to `.gitignore` — Enter
+defaults to yes; `--gitignore` pre-answers for scripts.
 
 ## 4. Use it
 
