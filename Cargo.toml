@@ -19,8 +19,8 @@ required-features = ["server"]
 
 [features]
 default = ["server"]
-# HTTP JSON API (axum). Disable with --no-default-features for a pure library build.
-server = ["dep:axum", "dep:tokio"]
+# HTTP JSON API (axum) + CLI service access (ureq). Disable with --no-default-features for a pure library build.
+server = ["dep:axum", "dep:tokio", "dep:ureq"]
 # Embedded local embedding model (candle + ONNX-free safetensors, runs in-process on CPU).
 local = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
 # Remote embedding provider (any OpenAI-compatible /embeddings endpoint).

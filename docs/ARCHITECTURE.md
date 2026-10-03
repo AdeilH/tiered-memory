@@ -225,7 +225,11 @@ simple embeddable setups and tests; same trait, same engine.
 ## 9. Deliberate limitations (v1)
 
 - Brute-force search, no ANN index (see §8 scale envelope).
-- Single-process; no cross-process locking over the data dir.
+- Single-process; no cross-process locking over the data dir. Coherence
+  between the CLI and a running service is preserved by policy instead:
+  CLI *write* commands (`init`, `remember`) post to the service when it
+  responds and only fall back to direct store writes when no service is
+  reachable. Read commands always load fresh from disk.
 - HTTP auth is one shared bearer token (opt-in via `{data}/token`) — sized for
   a personal standalone binary on loopback, not for multi-tenant serving.
 - Similar-project links are pairwise, not clustered multi-membership.

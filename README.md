@@ -134,6 +134,23 @@ curl -s -X POST localhost:7900/v1/params -H 'content-type: application/json' -d 
   "defaults": { "difficulty": 0.5, "lesson_style": "standard" } }'
 ```
 
+## Install
+
+The binary installs with cargo and is then usable from **any** project — Rust
+or not. Projects do *not* take it as a dependency; they talk to the installed
+binary over HTTP or by shelling out to the CLI.
+
+```bash
+# from a checkout / submodule
+cargo install --path tiered-memory          # add --features local for the embedded model
+
+# straight from git
+cargo install --git https://github.com/<you>/tiered-memory
+```
+
+This puts one `tiered-memory` binary on your PATH (default `~/.cargo/bin`) —
+it is the HTTP service *and* the CLI.
+
 ## The standalone binary & on-disk layout
 
 One binary, `tiered-memory`, is both the service and a local CLI. Data lives at
@@ -165,13 +182,39 @@ every automatic recomputation (it activates fully once both projects register).
 ### CLI
 
 ```bash
-tiered-memory projects        # every project currently using tiered memory
-tiered-memory select          # numbered picker → writes current-project
-tiered-memory select --project teacher
-tiered-memory params          # adjusted parameters for the selected project
-tiered-memory stats           # per-layer counts vs capacity
-tiered-memory serve           # the HTTP service (default command)
+cd any-project/            # Rust, Node, Python — anything
+tiered-memory init         # registers THIS project (auto-detected name/description)
+                           # and writes ./tiered-memory.json so hosts/agents
+                           # know the project id, user and service URL
+
+tiered-memory projects     # every project currently using tiered memory
+tiered-memory select       # numbered picker → writes current-project
+tiered-memory remember "prefers worked examples" --param depth=0.7
+tiered-memory recall "how should I introduce recursion?"
+tiered-memory params       # adjusted parameters for this project
+tiered-memory stats        # per-layer counts vs capacity
+tiered-memory serve        # the HTTP service (default command)
 ```
+
+Inside an init'ed project, `remember` / `recall` / `params` resolve the
+project from the local `tiered-memory.json` marker — no flags needed.
+
+Write commands (`init`, `remember`) go **through the running service when one
+is up** and fall back to writing the local store directly when it isn't, so
+the CLI and a live `serve` never disagree.
+
+### Using it from a non-Rust project
+
+Two ways, both dependency-free:
+
+1. **HTTP** — run `tiered-memory serve`, then use any HTTP client. A
+   zero-dependency Node 18+ client ships in
+   [`clients/node/tiered-memory.mjs`](clients/node/tiered-memory.mjs).
+2. **Shell out** — `tiered-memory remember "…"` / `tiered-memory recall "…"`
+   from scripts, npm scripts, Makefiles, agent hooks.
+
+`tiered-memory init` in the project gives both modes the project id; the
+`tiered-memory.json` it writes is the discovery file for host applications.
 
 ### Auth (opt-in, sized for a standalone binary)
 
@@ -180,9 +223,10 @@ machine that's the threat model. On a shared machine, drop a secret in
 `$TM_DATA_DIR/token` (e.g. `head -c 32 /dev/urandom | base64 > ~/tiered-memory/token`)
 and every route except `/v1/health` requires `Authorization: Bearer <token>`.
 
-## Use it as a Rust crate
+## Use it as a Rust crate (optional)
 
-The library is the same crate as the binary — depend on it directly:
+Rust projects that want in-process access can depend on the library — same
+crate as the binary:
 
 ```toml
 # from a local checkout / submodule
@@ -200,7 +244,8 @@ let engine = MemoryEngine::new(store, EmbedderConfig::default().build()?, Engine
 ```
 
 Swap the vectorizer without touching call sites via `EmbedderConfig`
-(`Hashing` / `Local` / `Http`) — see the embedder table below.
+(`Hashing` / `Local` / `Http`) — see the embedder table below. Non-Rust
+projects skip all of this: install the binary, run `init`, use HTTP or the CLI.
 
 ## Embedder backends
 

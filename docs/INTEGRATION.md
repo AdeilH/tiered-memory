@@ -1,12 +1,48 @@
 # Integrating tiered-memory into an application
 
-tiered-memory is deliberately **not bound to any host project**. Two ways in:
+tiered-memory is deliberately **not bound to any host project**, and host
+projects do **not** take it as a dependency. The binary installs once with
+cargo and serves every project on the machine, Rust or not:
 
-1. **HTTP service** (language-agnostic) — run `tiered-memory-server`, talk JSON.
-2. **Rust library** — depend on the crate and call `MemoryEngine` directly.
+```bash
+cargo install --path tiered-memory        # one binary: service + CLI
+```
+
+Two ways in, both dependency-free for the host:
+
+1. **HTTP service** — run `tiered-memory serve`, talk JSON from any language.
+2. **Shell out** — `tiered-memory remember "…"` / `recall "…"` / `params`
+   from scripts and build tools.
 
 This guide covers the HTTP path, with a zero-dependency Node client in
 [`clients/node/tiered-memory.mjs`](../clients/node/tiered-memory.mjs).
+
+## One-time setup per project: `init`
+
+Run inside any project directory (Node, Python, Rust — whatever):
+
+```bash
+cd teacher/
+tiered-memory init
+```
+
+It detects the project (name/description from `package.json`, `Cargo.toml`,
+`pyproject.toml`, or the directory name), registers it in the memory store —
+through the running service if one is up, otherwise straight to the local
+store — and writes a discovery file:
+
+```json
+{
+  "version": 1,
+  "project_id": "teacher",
+  "user": "local",
+  "service": "http://127.0.0.1:7900"
+}
+```
+
+Host code reads that file (or the CLI resolves it automatically) so no project
+has to hard-code its project id. Re-run `init` any time to update name or
+descriptor; `--name`, `--id`, `--descriptor` override detection.
 
 ## Running the service
 
@@ -84,6 +120,22 @@ Learner profile (from memory):
 - analogy_domain: games (global trait)
 - relevant: [L1] In this project the learner wants pure theory, no code examples
 ```
+
+## Shell-out integration (no HTTP at all)
+
+For scripts and build tools, the CLI is a complete interface:
+
+```bash
+tiered-memory init                                   # once per project
+tiered-memory remember "checkpoint failed on closures" --param difficulty=0.7
+tiered-memory recall "what does the learner struggle with?"
+tiered-memory params
+```
+
+Inside an init'ed project these resolve the project from the local
+`tiered-memory.json`; pass `--project` / `--user` to override. Writes go
+through the running service when one is up, so the CLI never fights a live
+server over the store.
 
 ## Wiring up the `teacher` project (concrete sketch)
 
