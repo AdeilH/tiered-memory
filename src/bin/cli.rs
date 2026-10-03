@@ -38,6 +38,7 @@ async fn main() {
         Some("select") => select(),
         Some("params") => params(),
         Some("remember") => remember(),
+        Some("feedback") => feedback_cmd(),
         Some("recall") => recall(),
         Some("sync") => sync_cmd(),
         Some("credentials") => credentials(),
@@ -77,6 +78,9 @@ USAGE:
   tiered-memory remember \"text\" [--project P] [--kind KIND]
                         [--param k=v]... [--pin] [--ttl DAYS] [--user U]
                                          store a memory
+  tiered-memory feedback <key> <value> [--global] [--project P]
+                                         assert one learner parameter
+                                         (the agent-facing signal API)
   tiered-memory recall \"query\" [--project P] [--k N] [--min F] [--user U]
                                          layered search
   tiered-memory sync [--file F | --text T | --stdin] [--project P] [--user U]
@@ -685,6 +689,93 @@ fn remember() -> Result<(), String> {
                 })
                 .map_err(|e| e.to_string())?;
             println!("stored `{}` (local store, no service running)", out.id);
+        }
+    }
+    Ok(())
+}
+
+/// Collect all non-flag arguments (flag values excluded).
+fn positional_list(args: &[String]) -> Vec<String> {
+    let mut skip_next = false;
+    let mut out = Vec::new();
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with('-') {
+            if matches!(
+                a.as_str(),
+                "--user" | "--project" | "--name" | "--id" | "--descriptor" | "--kind"
+                    | "--param" | "--ttl" | "--k" | "--min"
+            ) {
+                skip_next = true;
+            }
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
+/// Coerce a CLI string into a ParamValue: number → Number, true/false → Bool, else Text.
+fn coerce_value(v: &str) -> tiered_memory::ParamValue {
+    if let Ok(n) = v.parse::<f64>() {
+        tiered_memory::ParamValue::Number(n)
+    } else if v == "true" || v == "false" {
+        tiered_memory::ParamValue::Bool(v == "true")
+    } else {
+        tiered_memory::ParamValue::Text(v.to_string())
+    }
+}
+
+// -- feedback ----------------------------------------------------------------
+
+/// `tiered-memory feedback <key> <value> [--global]` — assert one learner
+/// parameter. The primary agent-facing signal API: agents call this the moment
+/// a learning signal happens (checkpoint outcome, pace complaint, preference).
+fn feedback_cmd() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let user = arg_value(&args, "--user").unwrap_or_else(default_user);
+    let positionals = positional_list(&args);
+    let (key, value) = match (positionals.first(), positionals.get(1)) {
+        (Some(k), Some(v)) => (k.clone(), coerce_value(v)),
+        _ => return Err("usage: tiered-memory feedback <key> <value> [--global]".into()),
+    };
+    let global = arg_switch(&args, "--global");
+    let project = if global {
+        None
+    } else {
+        Some(resolve_project(&args, &user)?)
+    };
+
+    let body = serde_json::json!({
+        "user": user,
+        "key": key,
+        "value": value,
+        "project_id": project,
+        "global": global,
+    });
+    match api_post("/v1/feedback", &body) {
+        Api::Ok(out) => {
+            println!("recorded {key} = {} (deduped: {})",
+                value.as_text(),
+                out["deduped"].as_bool().unwrap_or(false)
+            );
+        }
+        Api::Err(e) => return Err(e),
+        Api::Unreachable => {
+            local_engine()?
+                .feedback(tiered_memory::FeedbackInput {
+                    user: user.clone(),
+                    key,
+                    value,
+                    project_id: project,
+                    weight: None,
+                    global: Some(global),
+                })
+                .map_err(|e| e.to_string())?;
+            println!("recorded (local store, no service running)");
         }
     }
     Ok(())
