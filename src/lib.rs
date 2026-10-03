@@ -49,7 +49,9 @@ pub mod vector;
 #[cfg(feature = "server")]
 pub mod api;
 // LLM-assisted memory sync (OpenAI-compatible extraction) + its client.
-#[cfg(feature = "server")]
+// Available whenever an HTTP stack is: both `sync` and the `http` embedder
+// share the same OpenAI-compatible provider credentials.
+#[cfg(any(feature = "server", feature = "http"))]
 pub mod llm;
 #[cfg(feature = "server")]
 pub mod sync;

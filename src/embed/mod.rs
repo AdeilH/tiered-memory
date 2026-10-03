@@ -141,10 +141,10 @@ impl EmbedderConfig {
     /// | `TM_MODEL` | local preset: `minilm` \| `bge-small` (default `minilm`) |
     /// | `TM_MODEL_DIR` | local model directory override |
     /// | `TM_HF_CACHE` | cache dir for hub downloads |
-    /// | `TM_HTTP_URL` | embeddings endpoint (required for `http`) |
-    /// | `TM_HTTP_API_KEY` | bearer token for the endpoint |
-    /// | `TM_HTTP_MODEL` | provider model name |
-    /// | `TM_HTTP_DIMS` | provider vector dims (probed when omitted) |
+    ///
+    /// The `http` backend shares the single OpenAI-compatible provider config
+    /// (`credentials.json` / `TM_LLM_*` — see `LlmConfig`); there is no
+    /// separate embeddings configuration.
     pub fn from_env() -> Result<Self> {
         let kind = std::env::var("TM_EMBEDDER").unwrap_or_else(|_| "hashing".into());
         match kind.as_str() {
@@ -166,15 +166,20 @@ impl EmbedderConfig {
             )),
             #[cfg(feature = "http")]
             "http" => {
-                let url = std::env::var("TM_HTTP_URL").map_err(|_| {
-                    MemoryError::Embedder("TM_EMBEDDER=http requires TM_HTTP_URL".into())
-                })?;
-                Ok(EmbedderConfig::Http {
-                    url,
-                    api_key: std::env::var("TM_HTTP_API_KEY").ok(),
-                    model: std::env::var("TM_HTTP_MODEL").ok(),
-                    dims: std::env::var("TM_HTTP_DIMS").ok().and_then(|v| v.parse().ok()),
-                })
+                let data_dir = std::env::var("TM_DATA_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| crate::store::default_data_dir());
+                match crate::llm::LlmConfig::resolve(None, &data_dir)? {
+                    Some(c) if !c.base_url.trim().is_empty() => Ok(EmbedderConfig::Http {
+                        url: c.base_url,
+                        api_key: c.api_key,
+                        model: c.model,
+                        dims: None, // probed from the first response
+                    }),
+                    _ => Err(MemoryError::Embedder(
+                        "TM_EMBEDDER=http needs the OpenAI-compatible provider config — run `tiered-memory credentials` or set TM_LLM_BASE_URL / TM_LLM_API_KEY / TM_LLM_MODEL".into(),
+                    )),
+                }
             }
             #[cfg(not(feature = "http"))]
             "http" => Err(MemoryError::Embedder(

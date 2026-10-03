@@ -44,10 +44,13 @@ cargo install --path .                     # → ~/.cargo/bin/tiered-memory
 Data lives in `TM_DATA_DIR` (default `~/tiered-memory`) — everything the tool
 ever writes is under that one directory; delete it and memory is gone.
 
-## 2. Set up LLM credentials (needed for `sync`)
+## 2. Set up the LLM (needed for `sync`)
+
+One OpenAI-compatible provider config powers everything — memory extraction
+(`sync`), the model catalog (`models`), and the `http` embedder:
 
 ```bash
-tiered-memory credentials set
+tiered-memory credentials
 ```
 
 Interactive terminal wizard: pick a provider (OpenAI / OpenRouter / Groq /
@@ -55,8 +58,7 @@ Ollama / LM Studio / vLLM, or a custom URL) → masked API-key input → it
 **fetches the provider's live model list** and you type-to-search it. Saved to
 `{data}/credentials.json` with `0600` perms.
 
-Scripts can skip the TUI: `credentials set --base-url … --api-key … --model …`
-(`tiered-memory models` lists the catalog; `credentials show` is masked).
+Scripts can skip the TUI: `credentials set --base-url … --api-key … --model …`.
 Env vars `TM_LLM_BASE_URL` / `TM_LLM_API_KEY` / `TM_LLM_MODEL` also work.
 
 ## 3. Add a project
@@ -129,11 +131,19 @@ CLI writes route through a running service automatically, so the CLI and
 
 ### Auth
 
-Loopback + no token by default (personal-machine threat model — see
-[docs/SECURITY_ANALYSIS.md](docs/SECURITY_ANALYSIS.md)). For shared machines:
-put a secret in `$TM_DATA_DIR/token` (`head -c 32 /dev/urandom | base64 > token`)
-and every route except `/v1/health` requires `Authorization: Bearer <token>`.
-Non-loopback binds without a token are refused unless `TM_ALLOW_INSECURE=1`.
+Off by default — the service binds to loopback only, which is the right
+threat model for a personal binary (analysis in
+[docs/SECURITY_ANALYSIS.md](docs/SECURITY_ANALYSIS.md)). If you ever expose it:
+
+```bash
+tiered-memory auth on      # generates a token (0600), prints it once
+tiered-memory auth show    # or: off
+```
+
+then restart `serve` — every route except `/v1/health` now requires
+`Authorization: Bearer <token>` (the Node client accepts it as a second
+constructor argument). Non-loopback binds refuse to start without a token
+unless `TM_ALLOW_INSECURE=1`.
 
 ## Where your data lives
 
@@ -169,8 +179,9 @@ human-readable mirrors regenerated on every write:
 
 Embedder backends: `hashing` (offline, lexical, default), `local` (embedded
 candle sentence-transformer, CPU, no Python), `http` (any OpenAI-compatible
-`/embeddings` endpoint). Switching is safe — stores carry a fingerprint and
-refuse mixed geometries until `POST /v1/reindex`.
+`/embeddings` endpoint — **shares the same credentials as `sync`**, no separate
+config). Switching is safe — stores carry a fingerprint and refuse mixed
+geometries until `POST /v1/reindex`.
 
 ## As a Rust crate (optional)
 

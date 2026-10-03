@@ -15,14 +15,18 @@ export class TieredMemoryError extends Error {
 }
 
 export class TieredMemory {
-  constructor(baseUrl = 'http://127.0.0.1:7900') {
+  constructor(baseUrl = 'http://127.0.0.1:7900', token = process.env.TM_TOKEN) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.token = token || null;
   }
 
   async #call(method, path, body) {
+    const headers = {};
+    if (body !== undefined) headers['content-type'] = 'application/json';
+    if (this.token) headers['authorization'] = `Bearer ${this.token}`;
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
-      headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
+      headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();

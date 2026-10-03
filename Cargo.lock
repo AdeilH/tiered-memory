@@ -2400,6 +2400,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "crossterm",
+ "getrandom 0.3.4",
  "hf-hub",
  "http-body-util",
  "serde",

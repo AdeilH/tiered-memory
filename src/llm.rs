@@ -1,11 +1,12 @@
 //! OpenAI-compatible LLM client for the memory-extraction pipeline
-//! (`tiered-memory sync`) and credential management.
+//! (`tiered-memory sync`), the model catalog, and the `http` embedder —
+//! **one provider config powers all three**.
 //!
-//! Credentials resolve in order: explicit `--credentials <file>` >
-//! `{data}/credentials.json` (written by `tiered-memory credentials set`,
-//! permissions 0600) > `TM_LLM_BASE_URL` / `TM_LLM_API_KEY` / `TM_LLM_MODEL`
-//! env vars. Any OpenAI-compatible provider works — OpenAI, OpenRouter,
-//! Groq, Ollama (`http://localhost:11434/v1`), LM Studio, vLLM.
+//! Credentials resolve in order: `{data}/credentials.json` (written by
+//! `tiered-memory credentials`, permissions 0600) > `TM_LLM_BASE_URL` /
+//! `TM_LLM_API_KEY` / `TM_LLM_MODEL` env vars. Any OpenAI-compatible provider
+//! works — OpenAI, OpenRouter, Groq, Ollama (`http://localhost:11434/v1`),
+//! LM Studio, vLLM.
 
 use crate::error::{MemoryError, Result};
 use serde::{Deserialize, Serialize};
