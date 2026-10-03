@@ -64,9 +64,14 @@ When the user invokes this skill, run the full update pass:
 If none are set, either ask the user to run:
 
 ```bash
-tiered-memory credentials set --base-url https://api.openai.com/v1 \
-  --api-key sk-... --model gpt-4o-mini        # any OpenAI-compatible provider
+tiered-memory credentials set
 ```
+
+which opens an interactive terminal setup: pick a provider (OpenAI, OpenRouter,
+Groq, Ollama, LM Studio, vLLM or a custom URL), enter the API key (masked),
+and then **search the provider's live model list** (fetched from its
+`/models` endpoint; type-to-filter, arrow keys, Enter). Flags
+(`--base-url/--api-key/--model`) skip the TUI for scripts.
 
 …or fall back to doing the routing yourself: from the gathered state, decide
 for each new fact which layer owns it, then store it directly:

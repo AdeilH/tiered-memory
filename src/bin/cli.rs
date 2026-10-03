@@ -41,6 +41,7 @@ async fn main() {
         Some("recall") => recall(),
         Some("sync") => sync_cmd(),
         Some("credentials") => credentials(),
+        Some("models") => models(),
         Some("install-skill") => install_skill(),
         Some("stats") => stats(),
         Some("help") | Some("--help") | Some("-h") => {
@@ -79,8 +80,12 @@ USAGE:
                                          gather all 3 layers, extract new/changed
                                          knowledge with the configured LLM, write it
                                          back into the right layers
-  tiered-memory credentials set --base-url U --api-key K --model M
-  tiered-memory credentials show | clear  OpenAI-compatible LLM credentials
+  tiered-memory credentials set          interactive setup: pick a provider, enter
+                                         the key, then search the provider's live
+                                         model list (flags --base-url/--api-key/
+                                         --model skip the TUI for scripts)
+  tiered-memory credentials show | clear
+  tiered-memory models                   list the configured provider's models
   tiered-memory install-skill [--dir D]   install the /tiered-memory agent skill
                                          (default dir: ~/.agents/skills)
   tiered-memory stats   [--user U]       per-layer counts vs capacity
@@ -860,28 +865,50 @@ fn credentials() -> Result<(), String> {
 
     match sub {
         "set" => {
+            let has_flags = arg_value(&args, "--base-url").is_some()
+                || arg_value(&args, "--api-key").is_some()
+                || arg_value(&args, "--model").is_some()
+                || arg_value(&args, "--temperature").is_some();
+
             let mut config = tiered_memory::LlmConfig::load_from(&path)
                 .map_err(|e| e.to_string())?
                 .unwrap_or_default();
-            if let Some(v) = arg_value(&args, "--base-url") {
-                config.base_url = v;
+
+            if has_flags {
+                // scriptable path — exactly what the flags say, nothing else
+                if let Some(v) = arg_value(&args, "--base-url") {
+                    config.base_url = v;
+                }
+                if let Some(v) = arg_value(&args, "--api-key") {
+                    config.api_key = Some(v);
+                }
+                if let Some(v) = arg_value(&args, "--model") {
+                    config.model = v;
+                }
+                if let Some(v) = arg_value(&args, "--temperature") {
+                    config.temperature = v.parse::<f32>().ok();
+                }
+            } else if crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
+                // interactive wizard: provider → key → searchable model list
+                if !tiered_memory::tui::run_credentials_wizard(&mut config)
+                    .map_err(|e| e.to_string())?
+                {
+                    println!("cancelled — credentials unchanged");
+                    return Ok(());
+                }
+            } else {
+                return Err(
+                    "no TTY — pass --base-url/--api-key/--model or run from a terminal".into(),
+                );
             }
-            if let Some(v) = arg_value(&args, "--api-key") {
-                config.api_key = Some(v);
-            }
-            if let Some(v) = arg_value(&args, "--model") {
-                config.model = v;
-            }
-            if let Some(v) = arg_value(&args, "--temperature") {
-                config.temperature = v.parse::<f32>().ok();
-            }
+
             config.save_to(&path).map_err(|e| e.to_string())?;
             println!("credentials written to {}", path.display());
             println!("  base_url: {}", config.base_url);
             println!("  model:    {}", config.model);
             println!(
                 "  api_key:  {}",
-                mask_key(config.api_key.as_deref().unwrap_or("(none)"))
+                tiered_memory::llm::mask_key(config.api_key.as_deref().unwrap_or("(none)"))
             );
         }
         "show" => {
@@ -899,17 +926,18 @@ fn credentials() -> Result<(), String> {
                     println!("  model:    {}", c.model);
                     println!(
                         "  api_key:  {}",
-                        mask_key(c.api_key.as_deref().unwrap_or("(none)"))
+                        tiered_memory::llm::mask_key(c.api_key.as_deref().unwrap_or("(none)"))
                     );
                 }
                 None => {
                     println!("no LLM credentials configured.");
-                    println!("set them with:");
+                    println!("run the interactive setup with:");
+                    println!("  tiered-memory credentials set");
+                    println!("or non-interactively:");
                     println!(
-                        "  tiered-memory credentials set --base-url https://api.openai.com/v1 \\"
+                        "  tiered-memory credentials set --base-url https://api.openai.com/v1 --api-key sk-... --model gpt-4o-mini"
                     );
-                    println!("      --api-key sk-... --model gpt-4o-mini");
-                    println!("(any OpenAI-compatible provider works; env vars TM_LLM_BASE_URL / TM_LLM_API_KEY / TM_LLM_MODEL also work)");
+                    println!("(env vars TM_LLM_BASE_URL / TM_LLM_API_KEY / TM_LLM_MODEL also work)");
                 }
             }
         }
@@ -922,16 +950,33 @@ fn credentials() -> Result<(), String> {
                 Err(e) => return Err(format!("remove {}: {e}", path.display())),
             }
         }
-        other => return Err(format!("unknown credentials subcommand `{other}` (set | show | clear)")),
+        other => {
+            return Err(format!(
+                "unknown credentials subcommand `{other}` (set | show | clear)"
+            ))
+        }
     }
     Ok(())
 }
 
-fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
-        return "*".repeat(key.len());
+/// `tiered-memory models` — list the configured provider's model catalog
+/// (the same data the wizard's searchable picker shows).
+fn models() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let credentials_path = arg_value(&args, "--credentials").map(PathBuf::from);
+    let config = tiered_memory::LlmConfig::resolve(credentials_path.as_deref(), &data_root())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            "no LLM credentials — run `tiered-memory credentials set` first".to_string()
+        })?;
+    let list = tiered_memory::llm::fetch_models(&config.base_url, config.api_key.as_deref())
+        .map_err(|e| e.to_string())?;
+    println!("models at {} ({}):", config.base_url, list.len());
+    for m in &list {
+        let cur = if *m == config.model { "  ← current" } else { "" };
+        println!("  {m}{cur}");
     }
-    format!("{}…{}", &key[..4], &key[key.len() - 2..])
+    Ok(())
 }
 
 // -- install-skill -----------------------------------------------------------

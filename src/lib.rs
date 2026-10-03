@@ -53,6 +53,9 @@ pub mod api;
 pub mod llm;
 #[cfg(feature = "server")]
 pub mod sync;
+// Interactive terminal UI (credentials wizard with searchable model picker).
+#[cfg(feature = "server")]
+pub mod tui;
 
 #[cfg(feature = "http")]
 pub use embed::http::HttpEmbedder;

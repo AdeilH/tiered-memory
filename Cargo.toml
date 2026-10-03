@@ -19,8 +19,9 @@ required-features = ["server"]
 
 [features]
 default = ["server"]
-# HTTP JSON API (axum) + CLI service access (ureq). Disable with --no-default-features for a pure library build.
-server = ["dep:axum", "dep:tokio", "dep:ureq"]
+# HTTP JSON API (axum) + CLI service access (ureq) + interactive TUI (crossterm).
+# Disable with --no-default-features for a pure library build.
+server = ["dep:axum", "dep:tokio", "dep:ureq", "dep:crossterm"]
 # Embedded local embedding model (candle + ONNX-free safetensors, runs in-process on CPU).
 local = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
 # Remote embedding provider (any OpenAI-compatible /embeddings endpoint).
@@ -40,6 +41,7 @@ candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.21", optional = true }
 hf-hub = { version = "0.4", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

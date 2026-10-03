@@ -252,9 +252,22 @@ upgrading.
 OpenRouter, Groq, Ollama (`http://localhost:11434/v1`), LM Studio, vLLM:
 
 ```bash
+tiered-memory credentials set
+```
+
+runs an **interactive terminal setup**: pick the provider from a searchable
+list (or type a custom base URL), enter the API key (masked, editable), then
+the wizard **fetches the provider's live model catalog** from its `/models`
+endpoint and lets you type-to-search it — arrow keys to move, Enter to select,
+or "✎ Type a model id manually…" when a provider has no list endpoint.
+
+For scripts, the same command takes flags and skips the TUI:
+
+```bash
 tiered-memory credentials set --base-url https://api.openai.com/v1 \
     --api-key sk-... --model gpt-4o-mini
-tiered-memory credentials show     # masked
+tiered-memory models              # list the configured provider's catalog
+tiered-memory credentials show    # masked
 tiered-memory credentials clear
 ```
 

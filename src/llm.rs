@@ -185,9 +185,73 @@ pub fn extract_json(text: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Mask an API key for display: `sk-t…90`.
+pub fn mask_key(key: &str) -> String {
+    if key.len() <= 8 {
+        return "*".repeat(key.len());
+    }
+    format!("{}…{}", &key[..4], &key[key.len() - 2..])
+}
+
+/// Fetch the model catalog from an OpenAI-compatible provider
+/// (`GET {base_url}/models`). Used by the credentials wizard's searchable
+/// model picker and the `tiered-memory models` command.
+pub fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+    let url = format!(
+        "{}/models",
+        base_url.trim_end_matches('/')
+    );
+    let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(15));
+    if let Some(key) = api_key {
+        if !key.trim().is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", key.trim()));
+        }
+    }
+    let resp = req
+        .call()
+        .map_err(|e| MemoryError::Embedder(format!("model list request to {url} failed: {e}")))?;
+    let parsed: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| MemoryError::Embedder(format!("bad model list response: {e}")))?;
+    let models = parse_models_json(&parsed);
+    if models.is_empty() {
+        return Err(MemoryError::Embedder(format!(
+            "no models found in the response from {url}"
+        )));
+    }
+    Ok(models)
+}
+
+/// Extract model ids from a `/models` response. Handles the OpenAI shape
+/// (`{"data": [{"id": …}]}`) plus common variants (`{"models": […]}`, bare
+/// string arrays) so local servers that bend the spec still work.
+pub fn parse_models_json(v: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut collect = |item: &serde_json::Value| {
+        if let Some(s) = item.as_str() {
+            ids.push(s.to_string());
+        } else if let Some(s) = item.get("id").and_then(|x| x.as_str()) {
+            ids.push(s.to_string());
+        } else if let Some(s) = item.get("name").and_then(|x| x.as_str()) {
+            ids.push(s.to_string());
+        }
+    };
+    for key in ["data", "models"] {
+        if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
+            for item in arr {
+                collect(item);
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn extract_json_handles_fences_and_prose() {
@@ -196,6 +260,15 @@ mod tests {
         let v = extract_json("Sure! Here it is: {\"updates\": [{\"level\":\"L1\"}]} done").unwrap();
         assert_eq!(v["updates"][0]["level"], "L1");
         assert!(extract_json("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_models_handles_openai_and_variants() {
+        let openai = json!({ "data": [ {"id": "gpt-4o-mini"}, {"id": "gpt-4o"} ] });
+        assert_eq!(parse_models_json(&openai), vec!["gpt-4o", "gpt-4o-mini"]);
+        let alt = json!({ "models": [ "llama3.2", {"name": "qwen2.5"} ] });
+        assert_eq!(parse_models_json(&alt), vec!["llama3.2", "qwen2.5"]);
+        assert!(parse_models_json(&json!({})).is_empty());
     }
 
     #[test]
