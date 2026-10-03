@@ -1,0 +1,51 @@
+[package]
+name = "tiered-memory"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+description = "L1/L2/L3 layered long-term memory engine for learner personalization, with pluggable embedding backends (embedded local model, HTTP provider, or dependency-free hashing)."
+keywords = ["memory", "embeddings", "personalization", "llm", "agent"]
+categories = ["database"]
+
+[lib]
+name = "tiered_memory"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tiered-memory"
+path = "src/bin/cli.rs"
+required-features = ["server"]
+
+[features]
+default = ["server"]
+# HTTP JSON API (axum). Disable with --no-default-features for a pure library build.
+server = ["dep:axum", "dep:tokio"]
+# Embedded local embedding model (candle + ONNX-free safetensors, runs in-process on CPU).
+local = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+# Remote embedding provider (any OpenAI-compatible /embeddings endpoint).
+http = ["dep:ureq"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
+
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", optional = true }
+hf-hub = { version = "0.4", optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+lto = "thin"
