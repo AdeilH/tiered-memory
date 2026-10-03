@@ -10,7 +10,7 @@ use crate::types::{ParamValue, ProjectInfo};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -30,8 +30,12 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     // health stays open so monitoring works without a token.
     Router::new()
         .route("/v1/stats/{user}", get(stats))
+        .route("/v1/context/{user}", get(context_no_project))
+        .route("/v1/context/{user}/{project}", get(context))
         .route("/v1/projects", post(projects))
+        .route("/v1/projects/group", post(set_group))
         .route("/v1/projects/{user}", get(list_projects))
+        .route("/v1/projects/{user}/{project}", delete(remove_project))
         .route("/v1/remember", post(remember))
         .route("/v1/recall", post(recall))
         .route("/v1/params", post(params))
@@ -137,6 +141,27 @@ async fn stats(
     Ok(Json(blocking(&state, move |e| e.stats(&user)).await?))
 }
 
+/// The gathered L1/L2/L3 state + adjusted parameters for one project scope —
+/// the same view `sync` gathers and the session-start hook renders as the
+/// learner brief. Without a project, only L3 is visible.
+async fn context_no_project(
+    State(state): State<Arc<ServerState>>,
+    Path(user): Path<String>,
+) -> ApiResult<crate::engine::MemoryContext> {
+    Ok(Json(
+        blocking(&state, move |e| e.memory_context(&user, None, 12)).await?,
+    ))
+}
+
+async fn context(
+    State(state): State<Arc<ServerState>>,
+    Path((user, project)): Path<(String, String)>,
+) -> ApiResult<crate::engine::MemoryContext> {
+    Ok(Json(
+        blocking(&state, move |e| e.memory_context(&user, Some(&project), 12)).await?,
+    ))
+}
+
 async fn projects(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ProjectInput>,
@@ -151,12 +176,45 @@ struct ListProjectsPath {
     user: String,
 }
 
+/// Assign the project's L2 group: `{"group": "rust-clis"}` to assign,
+/// `{"group": "none"}` to record an explicit no-group confirmation,
+/// `{"group": null}` to reset to unassigned.
+#[derive(Deserialize)]
+struct GroupBody {
+    user: String,
+    project_id: String,
+    #[serde(default)]
+    group: Option<String>,
+}
+
+async fn set_group(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<GroupBody>,
+) -> ApiResult<ProjectInfo> {
+    Ok(Json(
+        blocking(&state, move |e| {
+            e.set_project_group(&req.user, &req.project_id, req.group.as_deref())
+        })
+        .await?,
+    ))
+}
+
 async fn list_projects(
     State(state): State<Arc<ServerState>>,
     Path(ListProjectsPath { user }): Path<ListProjectsPath>,
 ) -> ApiResult<Vec<ProjectInfo>> {
     Ok(Json(
         blocking(&state, move |e| e.list_projects(&user)).await?,
+    ))
+}
+
+/// Unregister a project and forget all of its records (every level).
+async fn remove_project(
+    State(state): State<Arc<ServerState>>,
+    Path((user, project)): Path<(String, String)>,
+) -> ApiResult<usize> {
+    Ok(Json(
+        blocking(&state, move |e| e.remove_project(&user, &project)).await?,
     ))
 }
 

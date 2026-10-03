@@ -35,15 +35,42 @@ reindex), 500 (storage/embedder failure).
   "name": "Teacher AI Skill Studio",
   "tags": ["tutoring", "llm"],
   "components": ["frontend", "backend"],
-  "descriptor": "optional explicit descriptor text; defaults to name+tags+components"
+  "descriptor": "optional explicit descriptor text; defaults to name+tags+components",
+  "group": "tutors"                     // optional L2 group; omit to keep an existing one
 }
 ```
 → the stored `ProjectInfo` (including computed `similar: [...]`). Re-posting
 the same `project_id` updates it and recomputes links.
 
+## `POST /v1/projects/group`
+
+Assign the project's **L2 group** — the user-confirmed membership the agent
+skill asks about once per project. Group members see each other's L2 memories.
+
+```json
+{ "user": "adeel", "project_id": "teacher", "group": "tutors" }
+```
+`"group": "none"` records an explicit no-group confirmation (the skill stops
+asking); `"group": null` resets to unassigned. → the stored `ProjectInfo`.
+
 ## `GET /v1/projects/{user}`
 
 → array of `ProjectInfo`.
+
+## `DELETE /v1/projects/{user}/{project}`
+
+Unregisters the project and forgets all of its records (every level), and
+drops similarity links pointing at it → `3` (bare count of forgotten
+memories; 404 if unknown). The store reconciles the project's L1 folder and
+link entries on the next save.
+
+## `GET /v1/context/{user}` · `GET /v1/context/{user}/{project}`
+
+The gathered `MemoryContext` for a scope — L1/L2/L3 lines (no vectors) plus
+the adjusted parameter set with per-key provenance. This is what `sync`
+gathers and what the session-start hook renders into the learner brief.
+Without a project, only L3 is visible. Group-scoped L2 visibility applies
+(same rules as `recall`).
 
 ## `POST /v1/remember`
 
@@ -58,8 +85,14 @@ the same `project_id` updates it and recomputes links.
   "confidence": 0.8,                    // optional 0..1 (default 0.8)
   "pinned": false,                      // optional
   "ttl_days": 30,                       // optional
-  "level": "L1"                         // optional explicit placement; default routing:
+  "level": "L1",                        // optional explicit placement; default routing:
                                         //   trait or no project → L3, else L1
+  "group": "rust-clis",                 // optional; L2 record owned by the whole group
+                                        //   ("all my CLIs use clap") — implies level L2,
+                                        //   visible to every member project
+  "topic": "writing-style"              // optional category slug; files the L2 mirror
+                                        //   into <group>/<topic>.md (free text is
+                                        //   normalized, default: general)
 }
 ```
 → `{"id": "m…", "deduped": false, "demoted_to_l2": 0, "auto_consolidated": false}`

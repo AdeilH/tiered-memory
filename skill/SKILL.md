@@ -27,11 +27,22 @@ Run these immediately, before teaching anything:
 ```bash
 tiered-memory params                                    # adjusted parameters per layer
 tiered-memory recall "<what this session is about>" --k 5   # relevant memories
+tiered-memory group                                     # this project's L2 group
 ```
 
 Shape the session from what comes back: difficulty, pace, analogy domain,
 prior knowledge. Empty output means a new learner — calibrate by asking a
 couple of questions, then store what you learn (step 2).
+
+**Group check (once per project).** If `tiered-memory group` prints
+`group: (unset)`, this project has no L2 group yet. At a natural pause (don't
+interrupt the flow), either confirm the printed **suggestion** with the user
+or ask one short question: *"Which family of projects does this belong to —
+e.g. rust-clis, web-apps, tutors — or none?"* Then run
+`tiered-memory group set <name>` (or `group set none` if they say none).
+Never re-ask once a group is set or confirmed `none` — the user's answer is
+authoritative and the suggestion was only a proposal. Grouping matters: L2
+memories of this project surface to its group-mates and theirs to it.
 
 ### 2. During the session — capture signals as they happen
 
@@ -40,7 +51,7 @@ then keep teaching. Don't wait for the learner to ask, and don't batch it all
 for the end.
 
 ```bash
-# project-local preference with parameters (→ L1)
+# project-local preference with parameters (→ L1, the default)
 tiered-memory remember "In this course the learner wants pure theory, no code examples" \
   --param code_example_density=0
 
@@ -51,9 +62,18 @@ tiered-memory feedback pace slow --global
 # durable trait about the learner (→ L3)
 tiered-memory remember "Learner is strong in TypeScript, beginner in Rust" --global
 
-# explicit layer for related-scope knowledge (→ L2)
-tiered-memory remember "Prefers zustand on the frontend" --level L2
+# explicit layer: project-owned, surfaced to related scopes (→ L2)
+tiered-memory remember "Prefers zustand on the frontend" --level L2 --topic preferences
+
+# group-owned fact — true of every project in the group, no single owner (→ L2)
+tiered-memory remember "All CLI projects in this family use clap" --group rust-clis --topic tooling
 ```
+
+File every L2 memory with `--topic <slug>` (short kebab-case, e.g.
+`writing-style`, `flow`, `preferences`, `tooling`, `architecture`) — the
+store turns L2 into browsable per-topic docs at
+`cache/L2/groups/<group>/<topic>.md`. Reuse a topic that already exists when
+it fits; don't invent a near-duplicate.
 
 Signal → command mapping (tutoring signals, but the pattern generalizes):
 
@@ -65,11 +85,15 @@ Signal → command mapping (tutoring signals, but the pattern generalizes):
 | likes a particular analogy domain | `feedback analogy_domain <domain> --global` |
 | mentions strong prior knowledge | `remember "strong in X" --global` |
 | mentions their goal ("interview prep") | `remember` it — goal belongs in L3 |
+| convention shared by sibling/similar projects | `remember … --level L2 --topic <slug>` |
+| convention true of the whole group ("all my CLIs use clap") | `remember … --group <their group> --topic <slug>` |
 
 Rules: store only **durable** facts (never one-off questions or session
 noise); prefer `--param` over prose when the thing is a tunable; L3 only for
-traits that clearly hold across projects; never store credentials or secrets
-from the conversation.
+traits that clearly hold across projects; when unsure between L1 and L3,
+choose L1 — consolidation lifts agreeing parameters into L3 automatically,
+but a wrong L3 never comes back down on its own; never store credentials or
+secrets from the conversation.
 
 ### 3. Session end (or on request) — the full sync pass
 
@@ -111,7 +135,9 @@ above, and store them with `remember` / `feedback`.
 ```bash
 tiered-memory params                     # adjusted parameters for this project
 tiered-memory recall "query"             # layer-annotated search
-tiered-memory remember "text" [--param k=v]… [--global | --level L2] [--pin]
+tiered-memory group                      # this project's L2 group (+ suggestion)
+tiered-memory group set <name|none>      # assign the L2 group (once per project)
+tiered-memory remember "text" [--param k=v]… [--global | --level L2 --topic T | --group NAME --topic T] [--pin]
 tiered-memory feedback <key> <value> [--global]
 tiered-memory projects                   # every project using tiered memory
 tiered-memory stats                      # per-layer counts vs capacity
@@ -120,7 +146,9 @@ tiered-memory stats                      # per-layer counts vs capacity
 ## Data
 
 Everything lives under `TM_DATA_DIR` (default `~/tiered-memory`):
-`cache/L1/<project>/memories.md`, `cache/L2/` (with hand-editable
-`similar-projects.txt`), `cache/L3/` — human-readable mirrors are regenerated
-on every write. Pinned memories survive eviction; TTLs expire on
-consolidation.
+`cache/L1/<project>/memories.md`, `cache/L2/` — filed per group and per topic
+as `groups/<group>/<topic>.md` (with hand-editable `groups.txt` and
+`similar-projects.txt`; records of groupless projects land in
+`ungrouped/<topic>.md`) — and `cache/L3/memories.md`. Human-readable mirrors
+are regenerated on every write. Pinned memories survive eviction; TTLs expire
+on consolidation.

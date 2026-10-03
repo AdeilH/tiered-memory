@@ -40,9 +40,32 @@ pub fn system_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Reserved group label: `group set none` records that the user explicitly
+/// confirmed the project belongs to **no** L2 group (the skill stops asking).
+/// Not a real group — every engine path normalizes it away.
+pub const NO_GROUP: &str = "none";
+
+/// `Some("none")` → `None`; real groups pass through.
+pub fn effective_group(group: Option<&str>) -> Option<&str> {
+    group.filter(|g| *g != NO_GROUP)
+}
+
 pub(crate) fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     m.lock()
         .map_err(|p| MemoryError::Storage(format!("lock poisoned: {p}")))
+}
+
+/// An all-zero embedding carries no signal — cosine against it is NaN, so it
+/// silently never matches anything and just poisons the store. That only
+/// happens when the embedder is broken (failed model load, empty feature
+/// extraction), so refuse it loudly instead of persisting it.
+fn ensure_embedded(vector: &[f32], what: &str) -> Result<()> {
+    if vector.iter().all(|&v| v == 0.0) {
+        return Err(MemoryError::Embedder(format!(
+            "embedder returned an all-zero vector for {what} — check the embedding backend (TM_EMBEDDER) and the configured model"
+        )));
+    }
+    Ok(())
 }
 
 /// Tunable policy knobs. Defaults are sane for a single-learner local service.
@@ -152,6 +175,10 @@ pub struct ProjectInput {
     /// Defaults to `name + tags + components`.
     #[serde(default)]
     pub descriptor: Option<String>,
+    /// L2 group to assign at registration. Omitted → an existing project keeps
+    /// its current group (re-init never wipes it).
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -179,6 +206,16 @@ pub struct RememberInput {
     /// Explicit layer placement; omit for automatic routing.
     #[serde(default)]
     pub level: Option<Level>,
+    /// Write an L2 record owned by a **group** of projects ("all my CLIs use
+    /// clap") instead of one project. Implies L2; the record is visible to
+    /// every member of the group.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Category slug ("writing-style", "flow", "preferences") used to file
+    /// the human-readable L2 mirrors into per-topic files. Optional; free
+    /// text is normalized (lowercase kebab-case).
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,6 +353,12 @@ pub struct MemoryContext {
     pub l2: Vec<MemoryLine>,
     pub l3: Vec<MemoryLine>,
     pub params: Vec<ParamSuggestion>,
+    /// The project's L2 group (family of related projects), if assigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Project ids sharing that group — L2 writes here surface to all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_members: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,17 +374,36 @@ pub struct MemoryEngine {
     writes: AtomicU32,
 }
 
-fn visible_at(r: &MemoryRecord, project: Option<&str>, similar: &HashSet<String>) -> bool {
+/// Visibility of one record for a recall in `project`. `similar` is the
+/// project's explicit similarity links; `my_group` its L2 group; `groups`
+/// maps every project id to its group (effective — `none` already removed).
+fn visible_at(
+    r: &MemoryRecord,
+    project: Option<&str>,
+    similar: &HashSet<String>,
+    my_group: Option<&str>,
+    groups: &HashMap<String, String>,
+) -> bool {
     match r.level {
         // L1 serves only its own project — the hot line.
         Level::L1 => project.is_some() && r.project_id.as_deref() == project,
-        // L2 serves its own project *and* related scopes (same project's other
-        // components live under the same project id; similar projects are
-        // linked in `ProjectInfo.similar`).
-        Level::L2 => match (project, r.project_id.as_deref()) {
-            (Some(p), Some(rp)) => rp == p || similar.contains(rp),
-            _ => false,
-        },
+        // L2 serves its own project *and* related scopes: same project's other
+        // components (same id), similar projects (explicit links), and — when
+        // the project has an L2 group — every other member of that group.
+        Level::L2 => {
+            // group-owned record ("all my CLIs use clap"): every member sees it
+            if let Some(g) = effective_group(r.group.as_deref()) {
+                return my_group == Some(g);
+            }
+            match (project, r.project_id.as_deref()) {
+                (Some(p), Some(rp)) => {
+                    rp == p
+                        || similar.contains(rp)
+                        || my_group.is_some() && groups.get(rp).map(String::as_str) == my_group
+                }
+                _ => false,
+            }
+        }
         // L3 is global.
         Level::L3 => true,
     }
@@ -353,6 +415,14 @@ fn eviction_value(r: &MemoryRecord, now_ms: u64) -> f32 {
     let recency = 2f32.powf(-age_days / 30.0);
     let key_boost = if r.key_hint.is_some() { 1.25 } else { 1.0 };
     r.confidence * recency * (1.0 + (1.0 + r.use_count as f32).ln()) * key_boost
+}
+
+/// The recall ranking formula (mirrored in docs/ARCHITECTURE.md):
+/// `score = cosine × level_weight × (0.5 + 0.5·confidence) × (1 + 0.15·2^(−age/14d))`
+/// — similarity dominates; layer, confidence and freshness nudge ties.
+fn recall_score(sim: f32, level: Level, confidence: f32, age_ms: u64) -> f32 {
+    let age_days = age_ms as f32 / DAY_MS as f32;
+    sim * level.weight() * (0.5 + 0.5 * confidence) * (1.0 + 0.15 * 2f32.powf(-age_days / 14.0))
 }
 
 impl MemoryEngine {
@@ -449,6 +519,160 @@ impl MemoryEngine {
         demoted
     }
 
+    /// Copy one deep (L2/L3) record up into L1 of `project` — write-allocate.
+    /// Skips (returns `None`) when an L1 copy already exists; the original
+    /// stays untouched and the copy carries `origin` so dedupe works.
+    fn promote_into_l1(
+        &self,
+        db: &mut UserDb,
+        user: &str,
+        project: &str,
+        idx: usize,
+        now_ms: u64,
+    ) -> Option<String> {
+        let (id, text, vector, kind, params, key_hint, confidence, topic) = {
+            let src = &db.records[idx];
+            (
+                src.id.clone(),
+                src.text.clone(),
+                src.vector.clone(),
+                src.kind,
+                src.params.clone(),
+                src.key_hint.clone(),
+                src.confidence,
+                src.topic.clone(),
+            )
+        };
+        let already = db.records.iter().any(|r| {
+            r.level == Level::L1
+                && r.project_id.as_deref() == Some(project)
+                && (r.id == id || r.origin.as_deref() == Some(id.as_str()))
+        });
+        if already {
+            return None;
+        }
+        let new_id = self.next_id(&text, now_ms);
+        db.records.push(MemoryRecord {
+            id: new_id.clone(),
+            user_id: user.to_string(),
+            text,
+            vector,
+            level: Level::L1,
+            project_id: Some(project.to_string()),
+            group: None,
+            topic,
+            kind,
+            params,
+            key_hint,
+            confidence,
+            pinned: false,
+            created_at_ms: now_ms,
+            last_used_at_ms: now_ms,
+            use_count: 1,
+            origin: Some(id),
+            expires_at_ms: None,
+        });
+        Some(new_id)
+    }
+
+    /// Write-path steps 1–2: fold the incoming payload into an existing
+    /// record at this scope — by parameter key first (re-asserting a key is
+    /// an update, not a new line of cache), then by near-identical content.
+    /// Returns the record id when an upsert happened.
+    fn upsert_in_scope(
+        db: &mut UserDb,
+        level: Level,
+        project_id: Option<&str>,
+        inc: &Incoming,
+        dup_threshold: f32,
+    ) -> Option<String> {
+        // 1) upsert by key
+        if let Some(kh) = &inc.key_hint {
+            if let Some(rec) = db.records.iter_mut().find(|r| {
+                r.level == level
+                    && r.project_id.as_deref() == project_id
+                    && r.key_hint.as_deref() == Some(kh.as_str())
+            }) {
+                rec.text = inc.text.clone();
+                rec.vector = inc.vector.clone();
+                for (k, v) in inc.params.clone() {
+                    rec.params.insert(k, v);
+                }
+                rec.confidence = (rec.confidence + inc.confidence) / 2.0;
+                rec.last_used_at_ms = inc.now;
+                rec.expires_at_ms = inc.expires_at_ms;
+                rec.use_count += 1;
+                if inc.topic.is_some() {
+                    rec.topic = inc.topic.clone();
+                }
+                if let Some(p) = inc.pinned {
+                    rec.pinned = p;
+                }
+                return Some(rec.id.clone());
+            }
+        }
+
+        // 2) near-duplicate content at the same scope merges in place
+        let mut best: Option<(usize, f32)> = None;
+        for (i, r) in db.records.iter().enumerate() {
+            if r.level == level && r.project_id.as_deref() == project_id && !r.vector.is_empty() {
+                let sim = cosine(&inc.vector, &r.vector);
+                if sim > dup_threshold && best.map(|(_, s)| sim > s).unwrap_or(true) {
+                    best = Some((i, sim));
+                }
+            }
+        }
+        let i = best?.0;
+        let rec = &mut db.records[i];
+        rec.text = inc.text.clone();
+        rec.vector = inc.vector.clone();
+        for (k, v) in inc.params.clone() {
+            rec.params.insert(k, v);
+        }
+        rec.confidence = (1.0 - (1.0 - rec.confidence) * (1.0 - inc.confidence)).min(0.99);
+        rec.last_used_at_ms = inc.now;
+        rec.use_count += 1;
+        if inc.topic.is_some() {
+            rec.topic = inc.topic.clone();
+        }
+        Some(rec.id.clone())
+    }
+
+    /// Write-path step 3: allocate a fresh cache line for the payload.
+    fn allocate_line(
+        &self,
+        db: &mut UserDb,
+        user: &str,
+        level: Level,
+        project_id: Option<String>,
+        group: Option<String>,
+        kind: MemoryKind,
+        inc: &Incoming,
+    ) -> String {
+        let id = self.next_id(&inc.text, inc.now);
+        db.records.push(MemoryRecord {
+            id: id.clone(),
+            user_id: user.to_string(),
+            text: inc.text.clone(),
+            vector: inc.vector.clone(),
+            level,
+            project_id,
+            group,
+            topic: inc.topic.clone(),
+            kind,
+            params: inc.params.clone(),
+            key_hint: inc.key_hint.clone(),
+            confidence: inc.confidence,
+            pinned: inc.pinned.unwrap_or(false),
+            created_at_ms: inc.now,
+            last_used_at_ms: inc.now,
+            use_count: 0,
+            origin: None,
+            expires_at_ms: inc.expires_at_ms,
+        });
+        id
+    }
+
     // -- projects ------------------------------------------------------------
 
     pub fn register_project(&self, req: ProjectInput) -> Result<ProjectInfo> {
@@ -477,10 +701,31 @@ impl MemoryEngine {
             .into_iter()
             .next()
             .expect("one embed");
+        ensure_embedded(&vector, &format!("project descriptor `{descriptor}`"))?;
 
         let dba = self.user_db(&req.user)?;
         let mut db = lock(&dba)?;
         self.ensure_fingerprint(&db)?;
+        // `none` records an explicit no-group confirmation; any other value
+        // must be a path-safe group name. A request without `group` never
+        // wipes an existing assignment (re-init / re-register keeps it).
+        let group = match req.group.as_deref() {
+            Some(NO_GROUP) => Some(NO_GROUP.to_string()),
+            Some(g) => {
+                if !crate::store::valid_path_segment(g) {
+                    return Err(MemoryError::invalid(format!(
+                        "invalid group name `{g}` (use letters, digits, '-', '_', '.')"
+                    )));
+                }
+                Some(g.to_string())
+            }
+            None => None,
+        };
+        let group = group.or_else(|| {
+            db.projects
+                .get(&req.project_id)
+                .and_then(|p| p.group.clone())
+        });
         db.projects.insert(
             req.project_id.clone(),
             ProjectInfo {
@@ -491,6 +736,7 @@ impl MemoryEngine {
                 descriptor,
                 descriptor_vector: vector,
                 similar: Vec::new(),
+                group,
                 created_at_ms: now,
             },
         );
@@ -504,6 +750,61 @@ impl MemoryEngine {
         let dba = self.user_db(user)?;
         let db = lock(&dba)?;
         Ok(db.projects.values().cloned().collect())
+    }
+
+    /// Assign the project's L2 group — the human-confirmed membership the
+    /// skill asks about once per project. `Some("none")` records an explicit
+    /// "belongs to no group" confirmation; `None` resets to unassigned.
+    pub fn set_project_group(
+        &self,
+        user: &str,
+        project_id: &str,
+        group: Option<&str>,
+    ) -> Result<ProjectInfo> {
+        let group = match group {
+            None => None,
+            Some(NO_GROUP) => Some(NO_GROUP.to_string()),
+            Some(g) => {
+                if !crate::store::valid_path_segment(g) || g == NO_GROUP {
+                    return Err(MemoryError::invalid(format!(
+                        "invalid group name `{g}` (use letters, digits, '-', '_', '.')"
+                    )));
+                }
+                Some(g.to_string())
+            }
+        };
+        let dba = self.user_db(user)?;
+        let mut db = lock(&dba)?;
+        self.ensure_fingerprint(&db)?;
+        let Some(p) = db.projects.get_mut(project_id) else {
+            return Err(MemoryError::ProjectNotFound(project_id.to_string()));
+        };
+        p.group = group;
+        let info = p.clone();
+        self.store.save(user, &db)?;
+        Ok(info)
+    }
+
+    /// Unregister a project: drop its registry entry, all of its records
+    /// (every level), and any similarity links pointing at it. Returns the
+    /// number of records removed. 404s when the project is unknown.
+    pub fn remove_project(&self, user: &str, project_id: &str) -> Result<usize> {
+        let dba = self.user_db(user)?;
+        let mut db = lock(&dba)?;
+        self.ensure_fingerprint(&db)?;
+        if db.projects.remove(project_id).is_none() {
+            return Err(MemoryError::ProjectNotFound(project_id.to_string()));
+        }
+        let before = db.records.len();
+        db.records
+            .retain(|r| r.project_id.as_deref() != Some(project_id));
+        let removed = before - db.records.len();
+        for p in db.projects.values_mut() {
+            p.similar.retain(|s| s != project_id);
+        }
+        // the store reconciles the project's L1 folder and links file on save
+        self.store.save(user, &db)?;
+        Ok(removed)
     }
 
     // -- write path ----------------------------------------------------------
@@ -520,120 +821,47 @@ impl MemoryEngine {
                 MemoryKind::Preference
             }
         });
-        let level = req.level.unwrap_or({
-            if kind == MemoryKind::Trait || req.project_id.is_none() {
-                Level::L3
-            } else {
-                Level::L1
-            }
-        });
-        if level == Level::L1 && req.project_id.is_none() {
-            return Err(MemoryError::invalid("L1 memories require a project_id"));
-        }
-        let confidence = req.confidence.unwrap_or(0.8).clamp(0.05, 1.0);
-        let now = (self.config.now)();
-        let expires_at_ms = req
-            .ttl_days
-            .map(|d| now + (d.max(0.0) * DAY_MS as f64) as u64);
-        let params = req.params.unwrap_or_default();
-        let key_hint = req.key_hint.clone().or_else(|| {
-            if params.len() == 1 {
-                params.keys().next().cloned()
-            } else {
-                None
-            }
-        });
-
-        let vector = self
+        let (level, project_id, group, topic) = resolve_placement(&req, kind)?;
+        let mut incoming = Incoming::new(
+            text,
+            req.params.unwrap_or_default(),
+            req.key_hint.clone(),
+            req.confidence.unwrap_or(0.8).clamp(0.05, 1.0),
+            req.ttl_days,
+            req.pinned,
+            topic,
+            (self.config.now)(),
+        )?;
+        // embed before locking: this may be a slow HTTP call
+        incoming.vector = self
             .embedder
-            .embed(std::slice::from_ref(&text))?
+            .embed(std::slice::from_ref(&incoming.text))?
             .into_iter()
             .next()
             .expect("one embed");
+        ensure_embedded(&incoming.vector, &format!("memory `{}`", incoming.text))?;
+        let now = incoming.now;
 
         let dba = self.user_db(&req.user)?;
         let mut db = lock(&dba)?;
         self.ensure_fingerprint(&db)?;
 
-        let mut deduped = false;
-        let mut record_id: Option<String> = None;
-
-        // 1) upsert by key: same parameter asserted again at the same scope
-        //    is an update, not a new line of cache.
-        if let Some(kh) = &key_hint {
-            if let Some(rec) = db.records.iter_mut().find(|r| {
-                r.level == level
-                    && r.project_id == req.project_id
-                    && r.key_hint.as_deref() == Some(kh.as_str())
-            }) {
-                rec.text = text.clone();
-                rec.vector = vector.clone();
-                for (k, v) in params.clone() {
-                    rec.params.insert(k, v);
-                }
-                rec.confidence = (rec.confidence + confidence) / 2.0;
-                rec.last_used_at_ms = now;
-                rec.expires_at_ms = expires_at_ms;
-                rec.use_count += 1;
-                if let Some(p) = req.pinned {
-                    rec.pinned = p;
-                }
-                deduped = true;
-                record_id = Some(rec.id.clone());
-            }
-        }
-
-        // 2) near-duplicate content at the same scope merges in place.
-        if record_id.is_none() {
-            let mut best: Option<(usize, f32)> = None;
-            for (i, r) in db.records.iter().enumerate() {
-                if r.level == level && r.project_id == req.project_id && !r.vector.is_empty() {
-                    let sim = cosine(&vector, &r.vector);
-                    if sim > self.config.dup_threshold && best.map(|(_, s)| sim > s).unwrap_or(true)
-                    {
-                        best = Some((i, sim));
-                    }
-                }
-            }
-            if let Some((i, _)) = best {
-                let rec = &mut db.records[i];
-                rec.text = text.clone();
-                rec.vector = vector.clone();
-                for (k, v) in params.clone() {
-                    rec.params.insert(k, v);
-                }
-                rec.confidence = (1.0 - (1.0 - rec.confidence) * (1.0 - confidence)).min(0.99);
-                rec.last_used_at_ms = now;
-                rec.use_count += 1;
-                deduped = true;
-                record_id = Some(rec.id.clone());
-            }
-        }
-
-        // 3) otherwise allocate a fresh line.
-        if record_id.is_none() {
-            let id = self.next_id(&text, now);
-            let record = MemoryRecord {
-                id: id.clone(),
-                user_id: req.user.clone(),
-                text: text.clone(),
-                vector,
-                level,
-                project_id: req.project_id.clone(),
-                kind,
-                params,
-                key_hint,
-                confidence,
-                pinned: req.pinned.unwrap_or(false),
-                created_at_ms: now,
-                last_used_at_ms: now,
-                use_count: 0,
-                origin: None,
-                expires_at_ms,
-            };
-            record_id = Some(id);
-            db.records.push(record);
-        }
+        // fold into an existing record at this scope (by parameter key, then
+        // by near-identical content); otherwise allocate a fresh cache line
+        let upserted = Self::upsert_in_scope(
+            &mut db,
+            level,
+            project_id.as_deref(),
+            &incoming,
+            self.config.dup_threshold,
+        );
+        let deduped = upserted.is_some();
+        let record_id = match upserted {
+            Some(id) => id,
+            None => self.allocate_line(
+                &mut db, &req.user, level, project_id, group, kind, &incoming,
+            ),
+        };
 
         let demoted_to_l2 = self.enforce_capacity(&mut db, level, now);
         self.store.save(&req.user, &db)?;
@@ -647,7 +875,7 @@ impl MemoryEngine {
         }
 
         Ok(RememberOutcome {
-            id: record_id.expect("id set"),
+            id: record_id,
             deduped,
             demoted_to_l2,
             auto_consolidated,
@@ -673,6 +901,8 @@ impl MemoryEngine {
             pinned: None,
             ttl_days: None,
             level: None,
+            group: None,
+            topic: None,
         })
     }
 
@@ -702,6 +932,8 @@ impl MemoryEngine {
             .and_then(|p| db.projects.get(p))
             .map(|pi| pi.similar.iter().cloned().collect())
             .unwrap_or_default();
+        let groups = effective_groups(&db);
+        let my_group = project.as_deref().and_then(|p| groups.get(p).cloned());
         let min_sim = req
             .min_similarity
             .or(self.config.default_min_similarity)
@@ -717,19 +949,25 @@ impl MemoryEngine {
             if r.is_expired(now) || r.vector.is_empty() {
                 continue;
             }
-            if !visible_at(r, project.as_deref(), &similar) {
+            if !visible_at(
+                r,
+                project.as_deref(),
+                &similar,
+                my_group.as_deref(),
+                &groups,
+            ) {
                 continue;
             }
             let sim = cosine(&qvec, &r.vector);
             if sim < min_sim {
                 continue;
             }
-            let age_days =
-                now.saturating_sub(r.last_used_at_ms.max(r.created_at_ms)) as f32 / DAY_MS as f32;
-            let score = sim
-                * r.level.weight()
-                * (0.5 + 0.5 * r.confidence)
-                * (1.0 + 0.15 * 2f32.powf(-age_days / 14.0));
+            let score = recall_score(
+                sim,
+                r.level,
+                r.confidence,
+                now.saturating_sub(r.last_used_at_ms.max(r.created_at_ms)),
+            );
             cands.push(Cand { idx, sim, score });
         }
         cands.sort_by(|a, b| {
@@ -763,7 +1001,7 @@ impl MemoryEngine {
         let do_promote = req.write_allocate.unwrap_or(self.config.write_allocate);
         if do_promote {
             if let Some(pid) = &project {
-                let to_promote: Vec<usize> = chosen
+                let hot: Vec<usize> = chosen
                     .iter()
                     .filter(|c| {
                         let r = &db.records[c.idx];
@@ -771,47 +1009,10 @@ impl MemoryEngine {
                     })
                     .map(|c| c.idx)
                     .collect();
-                for idx in to_promote {
-                    let (id, text, vector, kind, params, key_hint, confidence) = {
-                        let src = &db.records[idx];
-                        (
-                            src.id.clone(),
-                            src.text.clone(),
-                            src.vector.clone(),
-                            src.kind,
-                            src.params.clone(),
-                            src.key_hint.clone(),
-                            src.confidence,
-                        )
-                    };
-                    let already = db.records.iter().any(|r| {
-                        r.level == Level::L1
-                            && r.project_id.as_deref() == Some(pid.as_str())
-                            && (r.id == id || r.origin.as_deref() == Some(id.as_str()))
-                    });
-                    if already {
-                        continue;
+                for idx in hot {
+                    if let Some(new_id) = self.promote_into_l1(&mut db, &req.user, pid, idx, now) {
+                        promoted.push(new_id);
                     }
-                    let new_id = self.next_id(&text, now);
-                    db.records.push(MemoryRecord {
-                        id: new_id.clone(),
-                        user_id: req.user.clone(),
-                        text,
-                        vector,
-                        level: Level::L1,
-                        project_id: Some(pid.clone()),
-                        kind,
-                        params,
-                        key_hint,
-                        confidence,
-                        pinned: false,
-                        created_at_ms: now,
-                        last_used_at_ms: now,
-                        use_count: 1,
-                        origin: Some(id),
-                        expires_at_ms: None,
-                    });
-                    promoted.push(new_id);
                 }
                 if !promoted.is_empty() {
                     self.enforce_capacity(&mut db, Level::L1, now);
@@ -869,10 +1070,15 @@ impl MemoryEngine {
             .and_then(|p| db.projects.get(p))
             .map(|pi| pi.similar.iter().cloned().collect())
             .unwrap_or_default();
+        let groups = effective_groups(&db);
+        let my_group = project_id.and_then(|p| groups.get(p).cloned());
         let visible: Vec<&MemoryRecord> = db
             .records
             .iter()
-            .filter(|r| !r.is_expired(now) && visible_at(r, project_id, &similar))
+            .filter(|r| {
+                !r.is_expired(now)
+                    && visible_at(r, project_id, &similar, my_group.as_deref(), &groups)
+            })
             .collect();
         Ok(params::collect_suggestions(
             &visible,
@@ -915,13 +1121,14 @@ impl MemoryEngine {
             .and_then(|p| db.projects.get(p))
             .map(|pi| pi.similar.iter().cloned().collect())
             .unwrap_or_default();
+        let groups = effective_groups(&db);
+        let my_group = project_id.and_then(|p| groups.get(p).cloned());
+        let visible = |r: &MemoryRecord| {
+            !r.is_expired(now) && visible_at(r, project_id, &similar, my_group.as_deref(), &groups)
+        };
 
         let mut by_layer: BTreeMap<Level, Vec<MemoryLine>> = BTreeMap::new();
-        for r in db
-            .records
-            .iter()
-            .filter(|r| !r.is_expired(now) && visible_at(r, project_id, &similar))
-        {
+        for r in db.records.iter().filter(|r| visible(r)) {
             by_layer.entry(r.level).or_default().push(MemoryLine {
                 id: r.id.clone(),
                 text: r.text.clone(),
@@ -934,19 +1141,29 @@ impl MemoryEngine {
         for lines in by_layer.values_mut() {
             lines.truncate(per_layer_cap.max(1));
         }
+        let group_members = match (project_id, my_group.clone()) {
+            (Some(p), Some(g)) => db
+                .projects
+                .iter()
+                .filter(|(id, _)| {
+                    id.as_str() != p && groups.get(*id).map(String::as_str) == Some(g.as_str())
+                })
+                .map(|(id, _)| id.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
         Ok(MemoryContext {
             l1: by_layer.remove(&Level::L1).unwrap_or_default(),
             l2: by_layer.remove(&Level::L2).unwrap_or_default(),
             l3: by_layer.remove(&Level::L3).unwrap_or_default(),
             params: params::collect_suggestions(
-                &db.records
-                    .iter()
-                    .filter(|r| !r.is_expired(now) && visible_at(r, project_id, &similar))
-                    .collect::<Vec<_>>(),
+                &db.records.iter().filter(|r| visible(r)).collect::<Vec<_>>(),
                 now,
                 self.config.half_life_days,
                 self.config.numeric_param_tolerance,
             ),
+            group: my_group,
+            group_members,
         })
     }
 
@@ -1028,6 +1245,22 @@ impl MemoryEngine {
 
         // 4) trait lift: a parameter that keeps agreeing across projects is a
         //    global trait — lift it to L3 so every future project inherits it.
+        report.traits_lifted += self.lift_agreeing_traits(&mut db, user, now)?;
+
+        // 5) capacity across all layers
+        for lvl in [Level::L1, Level::L2, Level::L3] {
+            self.enforce_capacity(&mut db, lvl, now);
+        }
+
+        self.store.save(user, &db)?;
+        Ok(report)
+    }
+
+    /// Consolidation step 4. For every parameter key asserted with a
+    /// compatible value across `trait_lift_min_projects` distinct projects,
+    /// upsert one global L3 trait carrying the consensus value.
+    fn lift_agreeing_traits(&self, db: &mut UserDb, user: &str, now: u64) -> Result<usize> {
+        // newest assertion per (key, project)
         let mut by_key: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
         for (idx, r) in db.records.iter().enumerate() {
             if !matches!(r.level, Level::L1 | Level::L2)
@@ -1050,80 +1283,91 @@ impl MemoryEngine {
                 }
             }
         }
+
+        let mut lifted = 0;
         for (key, per_project) in by_key {
             if per_project.len() < self.config.trait_lift_min_projects {
                 continue;
             }
-            let idxs: Vec<usize> = per_project.values().copied().collect();
-            let values: Vec<&ParamValue> =
-                idxs.iter().map(|&i| &db.records[i].params[&key]).collect();
+            let values: Vec<&ParamValue> = per_project
+                .values()
+                .map(|&i| &db.records[i].params[&key])
+                .collect();
             let Some(consensus) =
                 params::consensus_value(&values, self.config.numeric_param_tolerance)
             else {
                 continue; // projects disagree — keep it local, let precedence decide
             };
-            let n = per_project.len();
-            let confidence = (0.5 + 0.15 * n as f32).min(0.97);
-            let text = format!(
-                "Across {} projects, the learner consistently sets {} = {}.",
-                n,
-                key,
-                consensus.as_text()
-            );
-            let vector = self
-                .embedder
-                .embed(std::slice::from_ref(&text))?
-                .into_iter()
-                .next()
-                .expect("one embed");
-            let existing = db
-                .records
-                .iter()
-                .position(|r| r.level == Level::L3 && r.key_hint.as_deref() == Some(key.as_str()));
-            match existing {
-                Some(pos) => {
-                    let r = &mut db.records[pos];
-                    r.text = text;
-                    r.vector = vector;
-                    r.params.insert(key.clone(), consensus);
-                    r.confidence = confidence;
-                    r.last_used_at_ms = now;
-                    r.use_count += 1;
-                }
-                None => {
-                    let id = self.next_id(&text, now);
-                    let mut p = BTreeMap::new();
-                    p.insert(key.clone(), consensus);
-                    db.records.push(MemoryRecord {
-                        id,
-                        user_id: user.to_string(),
-                        text,
-                        vector,
-                        level: Level::L3,
-                        project_id: None,
-                        kind: MemoryKind::Trait,
-                        params: p,
-                        key_hint: Some(key),
-                        confidence,
-                        pinned: false,
-                        created_at_ms: now,
-                        last_used_at_ms: now,
-                        use_count: 0,
-                        origin: None,
-                        expires_at_ms: None,
-                    });
-                }
+            self.upsert_l3_trait(db, user, &key, consensus, per_project.len(), now)?;
+            lifted += 1;
+        }
+        Ok(lifted)
+    }
+
+    /// Create or refresh the single L3 record carrying `key`'s consensus value.
+    fn upsert_l3_trait(
+        &self,
+        db: &mut UserDb,
+        user: &str,
+        key: &str,
+        consensus: ParamValue,
+        n_projects: usize,
+        now: u64,
+    ) -> Result<()> {
+        let confidence = (0.5 + 0.15 * n_projects as f32).min(0.97);
+        let text = format!(
+            "Across {} projects, the learner consistently sets {} = {}.",
+            n_projects,
+            key,
+            consensus.as_text()
+        );
+        let vector = self
+            .embedder
+            .embed(std::slice::from_ref(&text))?
+            .into_iter()
+            .next()
+            .expect("one embed");
+        ensure_embedded(&vector, &format!("lifted trait for `{key}`"))?;
+        let existing = db
+            .records
+            .iter_mut()
+            .find(|r| r.level == Level::L3 && r.key_hint.as_deref() == Some(key));
+        match existing {
+            Some(r) => {
+                r.text = text;
+                r.vector = vector;
+                r.params.insert(key.to_string(), consensus);
+                r.confidence = confidence;
+                r.last_used_at_ms = now;
+                r.use_count += 1;
             }
-            report.traits_lifted += 1;
+            None => {
+                let id = self.next_id(&text, now);
+                let mut params = BTreeMap::new();
+                params.insert(key.to_string(), consensus);
+                db.records.push(MemoryRecord {
+                    id,
+                    user_id: user.to_string(),
+                    text,
+                    vector,
+                    level: Level::L3,
+                    project_id: None,
+                    group: None,
+                    topic: None,
+                    kind: MemoryKind::Trait,
+                    params,
+                    key_hint: Some(key.to_string()),
+                    confidence,
+                    pinned: false,
+                    created_at_ms: now,
+                    last_used_at_ms: now,
+                    use_count: 0,
+                    origin: None,
+                    expires_at_ms: None,
+                });
+            }
         }
-
-        // 5) capacity across all layers
-        for lvl in [Level::L1, Level::L2, Level::L3] {
-            self.enforce_capacity(&mut db, lvl, now);
-        }
-
-        self.store.save(user, &db)?;
-        Ok(report)
+        Ok(())
     }
 
     pub fn forget(&self, req: ForgetInput) -> Result<usize> {
@@ -1164,6 +1408,11 @@ impl MemoryEngine {
         let mut db = lock(&dba)?;
         let texts: Vec<String> = db.records.iter().map(|r| r.text.clone()).collect();
         let vectors = self.embedder.embed(&texts)?;
+        // reindex overwrites every vector under the same fingerprint — a
+        // broken embedder would brick the store silently, so refuse first
+        for (text, v) in texts.iter().zip(&vectors) {
+            ensure_embedded(v, &format!("reindex of `{text}`"))?;
+        }
         for (r, v) in db.records.iter_mut().zip(vectors) {
             r.vector = v;
         }
@@ -1220,6 +1469,129 @@ impl MemoryEngine {
             dims: self.embedder.dims(),
             users,
         }
+    }
+}
+
+/// project id → effective L2 group for every project that has one (`none`
+/// filtered out). Built once per read path and handed to `visible_at`.
+fn effective_groups(db: &UserDb) -> HashMap<String, String> {
+    db.projects
+        .iter()
+        .filter_map(|(id, p)| {
+            effective_group(p.group.as_deref()).map(|g| (id.clone(), g.to_string()))
+        })
+        .collect()
+}
+
+/// Resolve the write placement from a request: the explicit level (or the
+/// automatic routing), group ownership, the project scope, and the normalized
+/// topic slug. All placement errors are raised here so `remember` stays a
+/// pure write path.
+///
+/// Group ownership is an L2 concept: `group` writes a record owned by the
+/// whole family of projects ("all my CLIs use clap"). Otherwise an L2 record
+/// is project-owned and its group visibility is derived from the project's
+/// *current* assignment at read time — regrouping a project moves what its
+/// memories surface to, no rewrite needed. For the same reason a group-owned
+/// record never carries a project: its home is the group, and regrouping a
+/// project must not drag group-level facts along.
+fn resolve_placement(
+    req: &RememberInput,
+    kind: MemoryKind,
+) -> Result<(Level, Option<String>, Option<String>, Option<String>)> {
+    let level = req.level.unwrap_or({
+        if kind == MemoryKind::Trait || req.project_id.is_none() {
+            Level::L3
+        } else {
+            Level::L1
+        }
+    });
+    let group =
+        match req.group.as_deref() {
+            None => None,
+            Some(NO_GROUP) => return Err(MemoryError::invalid(
+                "`none` is reserved (it confirms a project has no group) — not a writable group",
+            )),
+            Some(g) => {
+                if level != Level::L2 {
+                    return Err(MemoryError::invalid(
+                        "group-owned memories are L2 — pass level=L2 together with `group`",
+                    ));
+                }
+                if !crate::store::valid_path_segment(g) || g == NO_GROUP {
+                    return Err(MemoryError::invalid(format!(
+                        "invalid group name `{g}` (use letters, digits, '-', '_', '.')"
+                    )));
+                }
+                Some(g.to_string())
+            }
+        };
+    let project_id = if group.is_some() {
+        None
+    } else {
+        req.project_id.clone()
+    };
+    if level == Level::L1 && project_id.is_none() {
+        return Err(MemoryError::invalid("L1 memories require a project_id"));
+    }
+    if level == Level::L2 && project_id.is_none() && group.is_none() {
+        return Err(MemoryError::invalid(
+            "L2 memories need a project_id (project-owned) or a group (group-owned)",
+        ));
+    }
+    let topic = req.topic.as_deref().and_then(crate::store::normalize_topic);
+    Ok((level, project_id, group, topic))
+}
+
+/// The validated payload of a [`MemoryEngine::remember`] call — everything
+/// the write path needs, independent of where it lands. The embedding is
+/// attached right after construction so the (possibly slow) provider call
+/// happens *before* the store lock is taken.
+struct Incoming {
+    text: String,
+    vector: Vec<f32>,
+    params: BTreeMap<String, ParamValue>,
+    /// Canonical parameter key for upsert-by-key; falls back to the single
+    /// asserted parameter.
+    key_hint: Option<String>,
+    confidence: f32,
+    expires_at_ms: Option<u64>,
+    pinned: Option<bool>,
+    topic: Option<String>,
+    now: u64,
+}
+
+impl Incoming {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        text: String,
+        params: BTreeMap<String, ParamValue>,
+        key_hint: Option<String>,
+        confidence: f32,
+        ttl_days: Option<f64>,
+        pinned: Option<bool>,
+        topic: Option<String>,
+        now: u64,
+    ) -> Result<Self> {
+        let expires_at_ms = ttl_days.map(|d| now + (d.max(0.0) * DAY_MS as f64) as u64);
+        let key_hint = key_hint.or_else(|| {
+            if params.len() == 1 {
+                params.keys().next().cloned()
+            } else {
+                None
+            }
+        });
+        Ok(Incoming {
+            text,
+            vector: Vec::new(),
+            params,
+            key_hint,
+            confidence,
+            expires_at_ms,
+            pinned,
+            topic,
+            now,
+        })
     }
 }
 

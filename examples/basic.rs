@@ -33,6 +33,7 @@ fn main() -> tiered_memory::Result<()> {
             tags: vec![],
             components: vec![],
             descriptor: Some(desc.into()),
+            group: None,
         })?;
     }
 

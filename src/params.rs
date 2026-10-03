@@ -197,6 +197,8 @@ mod tests {
             vector: vec![],
             level,
             project_id: None,
+            group: None,
+            topic: None,
             kind: crate::types::MemoryKind::Feedback,
             params,
             key_hint: Some(key.into()),

@@ -115,8 +115,19 @@ pub struct MemoryRecord {
     pub vector: Vec<f32>,
     /// Which layer this record lives in (L1 project / L2 related / L3 global).
     pub level: Level,
-    /// Owning project for L1/L2 records; `None` for L3.
+    /// Owning project for L1/L2 records; `None` for L3 — and for L2 records
+    /// owned by a *group* rather than a single project (see `group`).
     pub project_id: Option<String>,
+    /// For L2 group-owned records: the group this fact is about ("all my CLI
+    /// projects use clap"). Visible to every member project of that group.
+    /// Never set on L1/L3 records; the reserved label `none` is not a group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Optional category slug ("writing-style", "flow", "preferences") used to
+    /// file the human-readable L2 mirrors into per-topic files. Pure
+    /// organization — recall and parameters ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub kind: MemoryKind,
     /// Structured parameter assertions carried by this memory.
     #[serde(default)]
@@ -170,6 +181,11 @@ pub struct ProjectInfo {
     /// Project ids whose L2 memories surface when recalling for this project.
     #[serde(default)]
     pub similar: Vec<String>,
+    /// The project's L2 group (a family of projects sharing warm memories,
+    /// e.g. `rust-clis`). The reserved value `none` means the user explicitly
+    /// confirmed this project belongs to no group — don't ask again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub created_at_ms: u64,
 }
 

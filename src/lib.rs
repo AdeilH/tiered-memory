@@ -58,6 +58,12 @@ pub mod sync;
 // Interactive terminal UI (credentials wizard with searchable model picker).
 #[cfg(feature = "server")]
 pub mod tui;
+// Harness registry + skill installer (SKILL.md copies, AGENTS.md blocks).
+#[cfg(feature = "server")]
+pub mod harnesses;
+// Read-only terminal dashboard (`tiered-memory console`).
+#[cfg(feature = "server")]
+pub mod console;
 
 #[cfg(feature = "http")]
 pub use embed::http::HttpEmbedder;
@@ -67,7 +73,7 @@ pub use embed::{Embedder, EmbedderConfig};
 pub use engine::{
     system_now_ms, ConsolidationReport, Counts, EngineConfig, EngineStats, FeedbackInput,
     ForgetInput, HealthInfo, MemoryContext, MemoryEngine, MemoryLine, NowFn, ProjectInput,
-    RecallHit, RecallInput, RecallOutput, RememberInput, RememberOutcome,
+    RecallHit, RecallInput, RecallOutput, RememberInput, RememberOutcome, NO_GROUP,
 };
 pub use error::{MemoryError, Result};
 pub use params::{ParamAlternative, ParamSuggestion};

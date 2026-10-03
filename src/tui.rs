@@ -26,20 +26,47 @@ pub struct ProviderPreset {
 }
 
 pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
-    ProviderPreset { name: "OpenAI", base_url: "https://api.openai.com/v1", local: false },
-    ProviderPreset { name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", local: false },
-    ProviderPreset { name: "Groq", base_url: "https://api.groq.com/openai/v1", local: false },
-    ProviderPreset { name: "Ollama (local)", base_url: "http://localhost:11434/v1", local: true },
-    ProviderPreset { name: "LM Studio (local)", base_url: "http://localhost:1234/v1", local: true },
-    ProviderPreset { name: "vLLM (local)", base_url: "http://localhost:8000/v1", local: true },
+    ProviderPreset {
+        name: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        local: false,
+    },
+    ProviderPreset {
+        name: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        local: false,
+    },
+    ProviderPreset {
+        name: "Groq",
+        base_url: "https://api.groq.com/openai/v1",
+        local: false,
+    },
+    ProviderPreset {
+        name: "Ollama (local)",
+        base_url: "http://localhost:11434/v1",
+        local: true,
+    },
+    ProviderPreset {
+        name: "LM Studio (local)",
+        base_url: "http://localhost:1234/v1",
+        local: true,
+    },
+    ProviderPreset {
+        name: "vLLM (local)",
+        base_url: "http://localhost:8000/v1",
+        local: true,
+    },
 ];
 
 // -- terminal plumbing -------------------------------------------------------
 
-struct RawGuard;
+/// Raw-mode + alternate-screen guard, shared with `harnesses.rs`'s picker:
+/// enables raw mode on [`enter`](RawGuard::enter), restores the terminal on
+/// drop (including through the picker's `?` error paths).
+pub(crate) struct RawGuard;
 
 impl RawGuard {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         enable_raw_mode().map_err(|e| MemoryError::invalid(format!("terminal: {e}")))?;
         execute!(stdout(), EnterAlternateScreen)
             .map_err(|e| MemoryError::invalid(format!("terminal: {e}")))?;
@@ -56,7 +83,10 @@ impl Drop for RawGuard {
 }
 
 fn width() -> u16 {
-    crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80).min(120)
+    crossterm::terminal::size()
+        .map(|(w, _)| w)
+        .unwrap_or(80)
+        .min(120)
 }
 
 fn trunc(s: &str, max: u16) -> String {
@@ -146,7 +176,12 @@ pub fn select_from_list(
             redraw = false;
             clear_screen();
             header(title);
-            draw(2, &format!("{FILTER_PREFIX}{filter}"), Some(Color::Cyan), None);
+            draw(
+                2,
+                &format!("{FILTER_PREFIX}{filter}"),
+                Some(Color::Cyan),
+                None,
+            );
 
             if filtered.is_empty() {
                 draw(4, "  (no matches)", Some(Color::DarkRed), None);
@@ -323,8 +358,7 @@ pub fn input_line(
 
 /// Wait for a key/resize event without busy-looping.
 fn event_available() -> Result<bool> {
-    poll(Duration::from_millis(250))
-        .map_err(|e| MemoryError::invalid(format!("terminal: {e}")))
+    poll(Duration::from_millis(250)).map_err(|e| MemoryError::invalid(format!("terminal: {e}")))
 }
 
 // -- credentials wizard ------------------------------------------------------
@@ -338,10 +372,7 @@ pub fn run_credentials_wizard(cfg: &mut crate::llm::LlmConfig) -> Result<bool> {
     // 1) provider / base URL
     let mut entries: Vec<(String, String)> = Vec::new();
     if !proposed.base_url.is_empty() {
-        entries.push((
-            "Keep current".to_string(),
-            proposed.base_url.clone(),
-        ));
+        entries.push(("Keep current".to_string(), proposed.base_url.clone()));
     }
     for p in PROVIDER_PRESETS {
         entries.push((p.name.to_string(), p.base_url.to_string()));
@@ -385,7 +416,9 @@ pub fn run_credentials_wizard(cfg: &mut crate::llm::LlmConfig) -> Result<bool> {
     }
 
     // 2) API key (masked)
-    let is_local = PROVIDER_PRESETS.iter().any(|p| p.base_url == proposed.base_url && p.local);
+    let is_local = PROVIDER_PRESETS
+        .iter()
+        .any(|p| p.base_url == proposed.base_url && p.local);
     let hint = if is_local {
         Some("local server — Enter to leave the key empty")
     } else if cfg.api_key.is_some() {
@@ -393,14 +426,7 @@ pub fn run_credentials_wizard(cfg: &mut crate::llm::LlmConfig) -> Result<bool> {
     } else {
         Some("input is hidden; leave empty only for local servers")
     };
-    let Some(key) = input_line(
-        "LLM credentials · API key",
-        "API key:",
-        "",
-        true,
-        hint,
-    )?
-    else {
+    let Some(key) = input_line("LLM credentials · API key", "API key:", "", true, hint)? else {
         return Ok(false);
     };
     if !key.trim().is_empty() {
@@ -437,8 +463,7 @@ pub fn run_credentials_wizard(cfg: &mut crate::llm::LlmConfig) -> Result<bool> {
                     .iter()
                     .position(|m| *m == proposed.model)
                     .map(|p| p + 1);
-                let Some(pick) =
-                    select_from_list("LLM credentials · model", &entries, preselect)?
+                let Some(pick) = select_from_list("LLM credentials · model", &entries, preselect)?
                 else {
                     return Ok(false);
                 };
@@ -491,7 +516,12 @@ pub fn run_credentials_wizard(cfg: &mut crate::llm::LlmConfig) -> Result<bool> {
                 continue;
             }
             match read()? {
-                Event::Key(KeyEvent { code, kind: KeyEventKind::Press, modifiers, .. }) => {
+                Event::Key(KeyEvent {
+                    code,
+                    kind: KeyEventKind::Press,
+                    modifiers,
+                    ..
+                }) => {
                     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
                         return Ok(false);
                     }

@@ -103,9 +103,13 @@ kind `feedback`, confidence `weight`.
 
 1. Embed the query; resolve visibility:
    - `L1` — records of exactly this project.
-   - `L2` — records of this project **plus** records of `similar` projects
-     (linked at registration by descriptor similarity; same-project components
-     share the project id, so they federate automatically).
+   - `L2` — records of this project **plus** records of related scopes:
+     `similar` projects (linked at registration by descriptor similarity),
+     the project's **L2 group** (a user-confirmed family of projects, e.g.
+     `rust-clis`; membership lives in `ProjectInfo.group` + the hand-editable
+     `groups.txt`), and group-owned records (`group` set on the record itself,
+     no single owning project — "all my CLIs use clap"). Same-project
+     components share the project id, so they federate automatically.
    - `L3` — everything global.
 2. Score every visible, unexpired record:
    `score = cosine × level_weight × (0.5 + 0.5·confidence) × (1 + 0.15·2^(−age_days/14))`
@@ -190,7 +194,10 @@ of a mutation (embedding happens outside), and saves after each mutation.
   cache/
     L1/<project-id>/memories.json    records at L1 of that project (machine)
     L1/<project-id>/memories.md      regenerated human-readable mirror
-    L2/memories.json|md              all L2 records ("one big file")
+    L2/memories.json                 all L2 records (flat machine store)
+    L2/groups/<g>/<topic>.md         human docs per group + topic
+    L2/ungrouped/<topic>.md          …for projects without a group
+    L2/groups.txt                    project → group membership (hand-editable)
     L2/similar-projects.txt          project link pairs
     L3/memories.json|md              user-level traits
 {root}/users/<other-user>/…          additional users
@@ -200,9 +207,9 @@ Design rules:
 
 - **JSON is authoritative; MD is a mirror.** Ids, vectors and timestamps are
   not human-editable data, so the machine record stays JSON (pretty-printed,
-  atomic tmp+rename). Each write regenerates the layer's `memories.md` — read,
-  grep and diff it freely; edits go through the API/CLI so the two never drift
-  silently.
+  atomic tmp+rename). Each write regenerates the layer's `memories.md` (L2:
+  the per-topic files) — read, grep and diff them freely; edits go through
+  the API/CLI so the two never drift silently.
 - **`similar-projects.txt` is the one authoritative human file.** One
   symmetric pair per line (`projectA projectB`). `save` writes the union of
   (whatever the file already contained) and (the computed links), so

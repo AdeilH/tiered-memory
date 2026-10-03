@@ -8,7 +8,7 @@
 //! components, similar projects), L3 = durable user-level traits. Parameter
 //! updates ride as structured `params` with a `key`, so re-assertions upsert.
 
-use crate::engine::{MemoryEngine, MemoryContext};
+use crate::engine::{MemoryContext, MemoryEngine};
 use crate::error::{MemoryError, Result};
 use crate::llm::LlmClient;
 use crate::types::{Level, MemoryKind, ParamValue};
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You maintain a layered long-term memory for a learner, organized like a CPU cache:
 
 - L1 (hot, project-local): preferences and facts specific to THE CURRENT PROJECT only. Example: "In this project the learner wants pure theory, no code examples".
-- L2 (warm, related scopes): knowledge that belongs to RELATED scopes — other components of the same product (frontend/backend) or similar projects. Use it when the insight matters to sibling work but not to the learner everywhere.
+- L2 (warm, related scopes): knowledge that belongs to RELATED scopes — other components of the same product (frontend/backend), similar projects, or the project's L2 GROUP (a named family of projects, listed below as "L2 GROUP" when one is assigned). Use it when the insight matters to sibling work but not to the learner everywhere; L2 entries written for this project become visible to its group-mates and similar projects.
 - L3 (cold, global traits): durable user-level traits that hold across ALL projects. Example: "Learner is strong in Python", "consistently prefers slow pace", "likes analogies from games".
 
 You will receive: the CURRENT memory state of all three layers (so you never re-assert what is already known), and a NEW conversation segment.
@@ -27,12 +27,13 @@ Extract ONLY genuinely new or CHANGED knowledge from the conversation. Rules:
 - Never repeat an existing memory verbatim or trivially rephrased. If the conversation adds nothing, return an empty list.
 - Prefer updating parameters: for anything tunable (difficulty, pace, lesson_style, analogy_domain, code_example_density, language, chart_lib, …), emit a params entry with the parameter key. Re-asserting a key updates it; use L1 for project-local values and L3 for values true across projects.
 - text: one short third-person sentence, self-contained ("The learner prefers worked examples over lectures").
+- topic: for L2 entries, a short kebab-case category used to file the memory into per-topic docs (examples: "writing-style", "flow", "preferences", "tooling", "architecture"). Reuse a category that already exists when it fits. Omit for L1/L3.
 - key: required when params is present — the canonical parameter key this entry asserts.
 - confidence: 0.5 (hint) to 1.0 (explicit, repeated).
 - Route conservatively: when unsure between L1 and L3, prefer L1; L3 only for traits that clearly generalize.
 
 Respond with ONLY a JSON object, no prose:
-{"updates": [{"level": "L1", "text": "...", "key": "difficulty", "params": {"difficulty": 0.4}, "confidence": 0.8}]}
+{"updates": [{"level": "L1", "text": "...", "key": "difficulty", "params": {"difficulty": 0.4}, "confidence": 0.8}, {"level": "L2", "text": "The learner writes concise commit messages", "topic": "writing-style", "confidence": 0.8}]}
 "#;
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,10 @@ pub struct SyncInput {
 pub struct SyncEntry {
     pub level: Level,
     pub text: String,
+    /// Category slug for L2 entries ("writing-style", …) — files the record
+    /// into per-topic docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -81,6 +86,8 @@ struct RawUpdate {
     level: String,
     text: String,
     #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
     key: Option<String>,
     #[serde(default)]
     params: Option<BTreeMap<String, serde_json::Value>>,
@@ -114,10 +121,23 @@ pub fn render_context(ctx: &MemoryContext) -> String {
     out.push_str(&layer("L1 (this project)", &ctx.l1));
     out.push_str(&layer("L2 (related scopes)", &ctx.l2));
     out.push_str(&layer("L3 (global traits)", &ctx.l3));
+    if let Some(g) = &ctx.group {
+        let members = if ctx.group_members.is_empty() {
+            String::from("(none yet)")
+        } else {
+            ctx.group_members.join(", ")
+        };
+        out.push_str(&format!("\nL2 GROUP: {g} (member projects: {members})\n"));
+    }
     if !ctx.params.is_empty() {
         out.push_str("\nCURRENT ADJUSTED PARAMETERS:\n");
         for p in &ctx.params {
-            out.push_str(&format!("- {} = {} [{:?}]\n", p.key, p.value.as_text(), p.source));
+            out.push_str(&format!(
+                "- {} = {} [{:?}]\n",
+                p.key,
+                p.value.as_text(),
+                p.source
+            ));
         }
     }
     out
@@ -183,13 +203,18 @@ pub fn plan(engine: &MemoryEngine, llm: &LlmClient, input: &SyncInput) -> Result
         };
         let params = u.params.as_ref().map(coerce_params);
         let key = u.key.clone().or_else(|| {
-            params
-                .as_ref()
-                .and_then(|p| if p.len() == 1 { p.keys().next().cloned() } else { None })
+            params.as_ref().and_then(|p| {
+                if p.len() == 1 {
+                    p.keys().next().cloned()
+                } else {
+                    None
+                }
+            })
         });
         plan.entries.push(SyncEntry {
             level,
             text: u.text.trim().to_string(),
+            topic: u.topic.as_deref().and_then(crate::store::normalize_topic),
             key,
             params: params.unwrap_or_default(),
             confidence: u.confidence.unwrap_or(0.75).clamp(0.3, 1.0),
@@ -230,6 +255,8 @@ pub fn apply(engine: &MemoryEngine, input: &SyncInput, plan: &SyncPlan) -> Resul
             pinned: None,
             ttl_days: None,
             level: Some(entry.level),
+            group: None,
+            topic: entry.topic.clone(),
         });
         match outcome {
             Ok(_) => report.stored.push(entry.clone()),
@@ -272,11 +299,15 @@ mod tests {
                 pinned: false,
             }],
             params: vec![],
+            group: Some("rust-clis".into()),
+            group_members: vec!["arg-parser".into()],
         };
         let s = render_context(&ctx);
         assert!(s.contains("L1 (this project)"));
         assert!(s.contains("wants pure theory"));
         assert!(s.contains("L2 (related scopes): (empty)"));
         assert!(s.contains("strong in Python"));
+        assert!(s.contains("L2 GROUP: rust-clis"));
+        assert!(s.contains("arg-parser"));
     }
 }

@@ -25,6 +25,15 @@ without depending on it.
 
 ## 1. Run it
 
+**Set up (recommended):** run inside any project directory and answer three
+short prompts — project registration, LLM provider (skipped if already
+configured), and which agent harness(es) get the skill:
+
+```bash
+cd my-project/
+tiered-memory setup
+```
+
 **Try it temporarily (nothing installed, nothing leaks):**
 
 ```bash
@@ -81,11 +90,14 @@ defaults to yes; `--gitignore` pre-answers for scripts.
 ```bash
 tiered-memory remember "In this project the learner wants pure theory" --param code_example_density=0
 tiered-memory remember "Learner is strong in Python" --global          # → L3 trait
+tiered-memory remember "All my CLI projects use clap" --group rust-clis  # → L2, group-owned
 tiered-memory recall "how should I introduce recursion?"
 tiered-memory params                                                   # adjusted parameters, per layer
+tiered-memory group                                                    # this project's L2 group
 tiered-memory projects                                                 # everything using tiered memory
 tiered-memory select                                                   # pick the current project
 tiered-memory stats                                                    # L1/L2/L3 counts vs capacity
+tiered-memory console                                                  # terminal dashboard (see §6)
 ```
 
 Inside an init'ed project the `--project` flag is unnecessary. Parameters
@@ -93,11 +105,84 @@ Inside an init'ed project the `--project` flag is unnecessary. Parameters
 **nearest layer wins** (L1 project → L2 related → L3 global), conflicts show
 up as `alternatives` in `params`.
 
+**L2 groups.** Projects can be assigned to a named group (a family like
+`rust-clis` or `tutors`) — group members share L2 memories. Run
+`tiered-memory group` to see the assignment (+ a suggestion from similar
+projects); the `/tiered-memory` skill asks about it **once per project** and
+`group set <name|none>` records the user's answer, which is authoritative —
+automatic clustering only proposes.
+
+**L2 docs, not one big file.** L2's human-readable layer is filed per group
+and per topic: `cache/L2/groups/rust-clis/writing-style.md`,
+`flow.md`, `preferences.md`, … Tag memories when writing them
+(`remember … --level L2 --topic writing-style`) or let the sync LLM pick the
+category; free text is normalized to a lowercase slug and records without one
+default to `general.md`. (Groupless projects' L2 records land in
+`ungrouped/<topic>.md`; the JSON beside it stays the machine record.)
+
 ## 5. Let your agent update memory: the `/tiered-memory` skill
 
+Every harness keeps skills somewhere different. `install-skill` knows the
+common targets, detects what's on your machine, and installs with a
+multi-select picker:
+
 ```bash
-tiered-memory install-skill        # → ~/.agents/skills/tiered-memory/SKILL.md
+tiered-memory install-skill            # interactive picker (detected first)
+tiered-memory install-skill --list     # the registry + install status
+tiered-memory install-skill --harness claude,agents   # scriptable
+tiered-memory install-skill --dir ~/.anywhere/skills  # custom directory
 ```
+
+Built-in targets: the Agent Skills spec (`~/.agents/skills`, used by ZCode and
+friends), Claude Code (user + project scope), and instruction blocks for
+harnesses that read project rules instead: Codex CLI (`AGENTS.md`), Junie
+(`.junie/guidelines.md`), Aider (`CONVENTIONS.md`), Cline/Roo (`.clinerules`),
+Windsurf (`.windsurf/rules/`). OpenCode and Gemini CLI are best-effort skill
+dirs. **Any harness not on the list is two lines away** — see below.
+
+**Adding your own harness.** Edit `harnesses.json` in the data dir
+(`~/tiered-memory/harnesses.json`, or `$TM_DATA_DIR/harnesses.json`):
+
+```json
+{
+  "harnesses": [{
+    "id": "commandcode",
+    "label": "CommandCode",
+    "target": ".commandcode/skills",
+    "mode": "skill-dir",
+    "scope": "user",
+    "detect": [".commandcode"]
+  }]
+}
+```
+
+`mode` is `skill-dir` (copy the skill into `<target>/tiered-memory/`) or
+`agents-md` (append the marked instruction block to the target file — works
+for any rules/guidelines markdown). `scope` anchors the path at `$HOME`
+(`user`) or the project (`project`). Custom entries show up everywhere the
+built-ins do: the picker, `install-skill --list` (marked `[custom]`),
+`clean`, and the console.
+
+**Subcommand completion.** Harnesses autocomplete skill *names*, not
+arguments — `/tiered-memory sync the session` passes free text to the model.
+To get real completion, install the subcommand family:
+`install-skill --subcommands` (the picker asks too). It adds thin sibling
+skills — `/tiered-memory-sync`, `-recall`, `-remember`, `-group`, `-params` —
+so typing `/tiered-memory` narrows the harness's completion to all of them,
+each with instructions for its command.
+
+**Hooks — memory without invoking anything.** Harnesses that support hooks
+can fire tiered-memory automatically:
+
+```bash
+tiered-memory install-hooks            # detected harnesses (claude, ZCode)
+tiered-memory install-hooks --harness claude --remove
+```
+
+Session start injects the learner brief (parameters, group, recent memories)
+into context; session end (Claude Code) syncs the transcript through the LLM
+pipeline. ZCode has no session-end event — end-of-session capture there stays
+with the `/tiered-memory` skill.
 
 Then, in any harness that loads skills, invoke **`/tiered-memory`** after a
 working session. The agent gathers all three layers, pipes the transcript
@@ -112,7 +197,19 @@ EOF
 # add --dry-run to preview without writing
 ```
 
-## 6. Or drive it over HTTP (for apps)
+## 6. Watch it work: the console
+
+```bash
+tiered-memory console
+```
+
+A read-only terminal dashboard (ratatui, five panels): layer gauges with
+capacity, the project table with per-project L1/L2 counts, L2 groups with
+their per-topic docs, every installed skill copy with its summary — and a
+graph drawing projects on the left, L2 groups on the right, and a line for
+each membership. `tab`/`←`/`→` switch panels, `r` refreshes, `q` quits.
+
+## 7. Or drive it over HTTP (for apps)
 
 ```bash
 tiered-memory serve        # http://127.0.0.1:7900
@@ -159,7 +256,11 @@ human-readable mirrors regenerated on every write:
 ├── projects/<id>.json                 ← project descriptors
 ├── cache/
 │   ├── L1/<project>/memories.json|md  ← hot, project-only
-│   ├── L2/memories.json|md            ← related scopes (one big file)
+│   ├── L2/memories.json               ← related scopes (flat machine store)
+│   │   ├── groups/<g>/<topic>.md      ← per-group, per-topic docs
+│   │   │                                 (writing-style.md, flow.md, …)
+│   │   ├── ungrouped/<topic>.md       ← L2 of projects without a group
+│   │   ├── groups.txt                 ← hand-editable group membership
 │   │   └── similar-projects.txt       ← hand-editable project links
 │   └── L3/memories.json|md            ← global user traits
 └── users/<other>/…                    ← additional users (server mode)
@@ -216,3 +317,15 @@ cargo test --features local -- --ignored  # + real-model smoke test
 ```
 
 MIT — see [LICENSE](LICENSE).
+
+## Uninstall
+
+```bash
+tiered-memory clean              # removes the data dir (~/tiered-memory —
+                                 # memories AND LLM credentials) and every
+                                 # installed agent skill copy; asks first
+cargo uninstall tiered-memory    # the binary itself
+```
+
+Per-project marker files (`tiered-memory.json`) are left in place — delete
+them per project if you want a spotless machine.

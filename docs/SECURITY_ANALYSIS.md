@@ -91,7 +91,8 @@ exactly the right place to be safe — and this makes the payload **persistent**
 
 ### M1 — Browser-origin attacks on the unauthenticated loopback service (Medium · HTTP API)
 
-**Where:** `src/api.rs` (no Host/Origin validation), `serve()` in `src/bin/cli.rs`.
+**Where:** `src/api.rs` (no Host/Origin validation), `serve()` in
+`src/bin/tiered-memory/service.rs`.
 
 The service is loopback-only *by default* and token-less unless
 `{data}/token` exists. Two browser-borne attacks defeat the loopback

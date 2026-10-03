@@ -6,9 +6,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
-use tiered_memory::{
-    LayeredDirStore, LlmClient, LlmConfig, MemoryEngine, SyncInput, LOCAL_USER,
-};
+use tiered_memory::{LayeredDirStore, LlmClient, LlmConfig, MemoryEngine, SyncInput, LOCAL_USER};
 
 /// One-shot mock of POST /chat/completions that replies with a canned
 /// assistant message (real HTTP, so the client's parsing is exercised too).
@@ -58,6 +56,7 @@ fn seed(engine: &MemoryEngine) {
             tags: vec![],
             components: vec!["frontend".into(), "backend".into()],
             descriptor: Some("ai tutoring studio".into()),
+            group: None,
         })
         .unwrap();
     // an existing global trait — the LLM must not re-assert it
@@ -77,7 +76,9 @@ fn sync_gathers_three_layers_extracts_and_applies() {
     seed(&engine);
 
     // gather state must show L1 empty for the fresh project, L3 carrying the trait
-    let ctx = engine.memory_context(LOCAL_USER, Some(PROJECT), 40).unwrap();
+    let ctx = engine
+        .memory_context(LOCAL_USER, Some(PROJECT), 40)
+        .unwrap();
     assert!(ctx.l1.is_empty());
     assert!(ctx.l3.iter().any(|l| l.text.contains("Python")));
 
@@ -115,20 +116,33 @@ fn sync_gathers_three_layers_extracts_and_applies() {
     // both entries apply; the re-asserted L3 trait updates the existing
     // record in place (content dedupe) instead of duplicating it — asserted
     // by the layer counts below
-    assert_eq!(report.stored.len(), 2, "L1 param update + L3 re-assertion apply");
+    assert_eq!(
+        report.stored.len(),
+        2,
+        "L1 param update + L3 re-assertion apply"
+    );
     assert_eq!(report.stored[0].level, tiered_memory::Level::L1);
-    assert_eq!(report.params_after["code_example_density"], tiered_memory::ParamValue::Number(0.0));
+    assert_eq!(
+        report.params_after["code_example_density"],
+        tiered_memory::ParamValue::Number(0.0)
+    );
 
     // the entry landed at L1 of the project, not globally
     let stats = engine.stats(LOCAL_USER).unwrap();
     assert_eq!(stats.counts.l1, 1);
-    assert_eq!(stats.counts.l3, 1, "existing trait still the only L3 record");
+    assert_eq!(
+        stats.counts.l3, 1,
+        "existing trait still the only L3 record"
+    );
 
     // and the params view reflects it
     let params = engine
         .parameters_with_defaults(LOCAL_USER, Some(PROJECT), &Default::default())
         .unwrap();
-    assert_eq!(params["code_example_density"], tiered_memory::ParamValue::Number(0.0));
+    assert_eq!(
+        params["code_example_density"],
+        tiered_memory::ParamValue::Number(0.0)
+    );
 }
 
 #[test]

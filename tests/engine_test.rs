@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tiered_memory::{
     EngineConfig, FeedbackInput, ForgetInput, JsonFileStore, Level, MemoryEngine, MemoryError,
-    ParamValue, ProjectInput, RecallInput, RememberInput,
+    MemoryStore, ParamValue, ProjectInput, RecallInput, RememberInput,
 };
 
 struct Clock(Arc<AtomicU64>);
@@ -54,6 +54,7 @@ fn register(engine: &MemoryEngine, project_id: &str, descriptor: &str) {
             tags: vec![],
             components: vec![],
             descriptor: Some(descriptor.into()),
+            group: None,
         })
         .unwrap();
 }
@@ -277,6 +278,252 @@ fn similar_projects_share_l2_memories() {
             .any(|h| h.text.contains("zustand") && h.level == Level::L2),
         "L2 memory of a similar project should surface"
     );
+}
+
+#[test]
+fn l2_groups_share_memories_across_members_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    register(&e, "projA", "rust cli argument parsing tooling");
+    register(&e, "projB", "rust terminal utility application");
+    register(&e, "projC", "react web dashboard interface");
+    e.set_project_group(U, "projA", Some("rust-clis")).unwrap();
+    e.set_project_group(U, "projB", Some("rust-clis")).unwrap();
+    e.set_project_group(U, "projC", Some("web-apps")).unwrap();
+
+    // project-owned L2 in projA — visible to group-mate projB, not to projC
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "prefer clap derive for argument parsing".into(),
+        project_id: Some("projA".into()),
+        level: Some(Level::L2),
+        ..Default::default()
+    })
+    .unwrap();
+    let b = recall(&e, "prefer clap derive argument parsing", Some("projB"));
+    assert!(
+        b.hits
+            .iter()
+            .any(|h| h.text.contains("clap") && h.level == Level::L2),
+        "group-mates must see each other's project-owned L2 memories"
+    );
+    let c = recall(&e, "prefer clap derive argument parsing", Some("projC"));
+    assert!(
+        !c.hits.iter().any(|h| h.text.contains("clap")),
+        "other groups must not see them"
+    );
+
+    // and in the other direction: projB's L2 surfaces to projA via the group
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "prefer ripgrep over grep for searching".into(),
+        project_id: Some("projB".into()),
+        level: Some(Level::L2),
+        ..Default::default()
+    })
+    .unwrap();
+    let a = recall(&e, "prefer ripgrep over grep searching", Some("projA"));
+    assert!(a.hits.iter().any(|h| h.text.contains("ripgrep")));
+
+    // group-owned record ("all my CLIs use clap"): no single owning project
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "all rust cli projects in this family use clap".into(),
+        level: Some(Level::L2),
+        group: Some("rust-clis".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    for p in ["projA", "projB"] {
+        let out = recall(&e, "all cli projects family use clap", Some(p));
+        assert!(
+            out.hits
+                .iter()
+                .any(|h| h.text.contains("family") && h.level == Level::L2),
+            "group-owned memory must surface for member {p}"
+        );
+    }
+    let hits = recall(&e, "all cli projects family use clap", Some("projC")).hits;
+    assert!(!hits.iter().any(|h| h.text.contains("family")));
+
+    // memory_context reports the group + members (the sync gather sees it)
+    let ctx = e.memory_context(U, Some("projA"), 40).unwrap();
+    assert_eq!(ctx.group.as_deref(), Some("rust-clis"));
+    assert_eq!(ctx.group_members, vec!["projB".to_string()]);
+
+    // `none` is a confirmation, not a group: projA leaving stops the sharing
+    e.set_project_group(U, "projA", Some(tiered_memory::NO_GROUP))
+        .unwrap();
+    let ctx = e.memory_context(U, Some("projA"), 40).unwrap();
+    assert_eq!(ctx.group, None, "`none` normalizes to no group");
+    let a = recall(&e, "prefer ripgrep over grep searching", Some("projA"));
+    assert!(
+        !a.hits.iter().any(|h| h.text.contains("ripgrep")),
+        "after leaving the group, group-mates' L2 must stop surfacing"
+    );
+    let a_own = recall(&e, "prefer clap derive argument parsing", Some("projA"));
+    assert!(
+        a_own.hits.iter().any(|h| h.text.contains("clap")),
+        "a project always still sees its own L2 memories"
+    );
+
+    // L2 with neither project nor group is rejected instead of silently invisible
+    let res = e.remember(RememberInput {
+        user: U.into(),
+        text: "orphan l2".into(),
+        level: Some(Level::L2),
+        ..Default::default()
+    });
+    assert!(matches!(res, Err(MemoryError::Invalid(_))));
+}
+
+#[test]
+fn topics_are_normalized_and_filed_into_per_topic_docs() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Clock::new();
+    let store = Arc::new(tiered_memory::LayeredDirStore::new(dir.path()).unwrap());
+    let embedder = tiered_memory::EmbedderConfig::Hashing { dims: 512 }
+        .build()
+        .unwrap();
+    let mut cfg = EngineConfig::default();
+    cfg.now = clock.now_fn();
+    let e = MemoryEngine::new(store, embedder, cfg);
+
+    e.register_project(ProjectInput {
+        user: U.into(),
+        project_id: "projA".into(),
+        name: Some("projA".into()),
+        tags: vec![],
+        components: vec![],
+        descriptor: Some("rust cli tooling project".into()),
+        group: None,
+    })
+    .unwrap();
+    e.set_project_group(U, "projA", Some("rust-clis")).unwrap();
+
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "keep commit messages concise and imperative".into(),
+        project_id: Some("projA".into()),
+        level: Some(Level::L2),
+        topic: Some("Writing Style".into()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // the slug was normalized before persistence
+    let loaded = tiered_memory::LayeredDirStore::new(dir.path())
+        .unwrap()
+        .load(U)
+        .unwrap()
+        .unwrap();
+    let rec = loaded
+        .records
+        .iter()
+        .find(|r| r.text.contains("commit"))
+        .unwrap();
+    assert_eq!(rec.topic.as_deref(), Some("writing-style"));
+
+    // and the human-readable mirror is filed per group + topic
+    let doc = std::fs::read_to_string(
+        dir.path()
+            .join("users/u1/cache/L2/groups/rust-clis/writing-style.md"),
+    )
+    .unwrap();
+    assert!(doc.contains("commit messages"), "{doc}");
+}
+
+#[test]
+fn zero_vector_embeddings_are_rejected_not_stored() {
+    use std::sync::Arc as StdArc;
+    use tiered_memory::{Embedder, Result as TmResult};
+
+    // a broken embedder: everything comes back all-zero (failed model load,
+    // empty feature extraction) — exactly what produced the junk `untitled`
+    // project with a zero descriptor vector
+    struct ZeroEmbedder;
+    impl Embedder for ZeroEmbedder {
+        fn name(&self) -> &'static str {
+            "zero"
+        }
+        fn embed(&self, texts: &[String]) -> TmResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| vec![0.0; t.len().max(4)]).collect())
+        }
+        fn dims(&self) -> usize {
+            4
+        }
+        fn default_min_similarity(&self) -> f32 {
+            0.05
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: StdArc<dyn tiered_memory::MemoryStore> =
+        Arc::new(JsonFileStore::new(dir.path()).unwrap());
+    let e = MemoryEngine::new(store, StdArc::new(ZeroEmbedder), EngineConfig::default());
+
+    // registration refuses instead of writing a junk project entry
+    let res = e.register_project(ProjectInput {
+        user: U.into(),
+        project_id: "untitled".into(),
+        name: Some("untitled".into()),
+        tags: vec![],
+        components: vec![],
+        descriptor: Some("untitled".into()),
+        group: None,
+    });
+    assert!(
+        matches!(res, Err(MemoryError::Embedder(_))),
+        "zero-vector descriptor must be rejected: {res:?}"
+    );
+    // and so must memories
+    let res = e.remember(RememberInput {
+        user: U.into(),
+        text: "some memory".into(),
+        ..Default::default()
+    });
+    assert!(matches!(res, Err(MemoryError::Embedder(_))));
+    // the store stays clean
+    let stats = e.stats(U).unwrap();
+    assert_eq!(stats.projects, 0);
+    assert_eq!(stats.counts.l1 + stats.counts.l2 + stats.counts.l3, 0);
+}
+
+#[test]
+fn remove_project_drops_registry_records_and_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    register(&e, "gone", "react frontend project");
+    register(&e, "keeper", "react frontend dashboard");
+
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "hot line for gone".into(),
+        project_id: Some("gone".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "l2 line for gone".into(),
+        project_id: Some("gone".into()),
+        level: Some(Level::L2),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let removed = e.remove_project(U, "gone").unwrap();
+    assert_eq!(removed, 2, "both records of the project are forgotten");
+
+    let projects = e.list_projects(U).unwrap();
+    assert!(projects.iter().all(|p| p.project_id != "gone"));
+    // links pointing at the removed project are dropped from survivors
+    let keeper = projects.iter().find(|p| p.project_id == "keeper").unwrap();
+    assert!(!keeper.similar.contains(&"gone".to_string()));
+
+    // unknown project 404s
+    let res = e.remove_project(U, "gone");
+    assert!(matches!(res, Err(MemoryError::ProjectNotFound(_))));
 }
 
 #[test]

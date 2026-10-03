@@ -9,7 +9,7 @@
 use crate::error::{MemoryError, Result};
 use crate::types::{Level, MemoryKind, MemoryRecord, ProjectInfo, UserDb};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,13 +33,31 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
-/// Path-safe identifier (used for user and project directory/file names).
-fn valid_path_segment(seg: &str) -> bool {
+/// Path-safe identifier (used for user, project, and group directory/file names).
+pub(crate) fn valid_path_segment(seg: &str) -> bool {
     !seg.is_empty()
         && !seg.starts_with('.')
         && seg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Fallback topic for L2 records filed without one.
+pub(crate) const DEFAULT_TOPIC: &str = "general";
+
+/// Normalize a topic slug ("Writing Style" → `writing-style`). Returns `None`
+/// when nothing usable remains — callers fall back to [`DEFAULT_TOPIC`].
+pub(crate) fn normalize_topic(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    (!out.is_empty() && valid_path_segment(&out)).then_some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +145,10 @@ impl MemoryStore for JsonFileStore {
 ///   cache/
 ///     L1/<project-id>/memories.json    hot, project-scoped records (machine)
 ///     L1/<project-id>/memories.md      …human-readable mirror
-///     L2/memories.json|md              related-scope records (one big file)
+///     L2/memories.json                 related-scope records (flat machine store)
+///     L2/groups/<group>/<topic>.md     human-readable docs per group + topic
+///     L2/ungrouped/<topic>.md          …for projects without a group
+///     L2/groups.txt                    project → group membership (hand-editable)
 ///     L2/similar-projects.txt          project similarity links (hand-editable)
 ///     L3/memories.json|md              user-level traits common to all projects
 ///   users/<other-user>/…                additional users (server mode)
@@ -217,7 +238,10 @@ impl LayeredDirStore {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| MemoryError::Storage(format!("corrupt {}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(MemoryError::Storage(format!("read {}: {e}", path.display()))),
+            Err(e) => Err(MemoryError::Storage(format!(
+                "read {}: {e}",
+                path.display()
+            ))),
         }
     }
 
@@ -229,135 +253,33 @@ impl LayeredDirStore {
     ) -> Result<()> {
         fs::create_dir_all(dir)
             .map_err(|e| MemoryError::Storage(format!("create {}: {e}", dir.display())))?;
-        atomic_write(&dir.join("memories.json"), &serde_json::to_vec_pretty(records)?)?;
-        atomic_write(&dir.join("memories.md"), render_md(title, embedder, records).as_bytes())?;
+        atomic_write(
+            &dir.join("memories.json"),
+            &serde_json::to_vec_pretty(records)?,
+        )?;
+        atomic_write(
+            &dir.join("memories.md"),
+            render_md(title, embedder, records).as_bytes(),
+        )?;
         Ok(())
     }
-}
 
-impl MemoryStore for LayeredDirStore {
-    fn load(&self, user: &str) -> Result<Option<UserDb>> {
-        let meta_path = self.meta_path(user)?;
-        let Ok(bytes) = fs::read(&meta_path) else {
-            return Ok(None);
-        };
-        let meta: Meta = serde_json::from_slice(&bytes)
-            .map_err(|e| MemoryError::Storage(format!("corrupt {}: {e}", meta_path.display())))?;
-        let user_dir = self.user_dir(user)?;
-
-        let mut db = UserDb::new(meta.embedder, meta.dims);
-
-        // project registry
-        let projects_dir = user_dir.join("projects");
-        if let Ok(entries) = fs::read_dir(&projects_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy().to_string();
-                if !name.ends_with(".json") {
-                    continue;
-                }
-                match fs::read(entry.path()) {
-                    Ok(bytes) => match serde_json::from_slice::<ProjectInfo>(&bytes) {
-                        Ok(p) => {
-                            db.projects.insert(p.project_id.clone(), p);
-                        }
-                        Err(e) => {
-                            return Err(MemoryError::Storage(format!(
-                                "corrupt project file {}: {e}",
-                                entry.path().display()
-                            )))
-                        }
-                    },
-                    Err(e) => {
-                        return Err(MemoryError::Storage(format!(
-                            "read {}: {e}",
-                            entry.path().display()
-                        )))
-                    }
-                }
-            }
-        }
-
-        // L1 — one folder per project
-        let l1_root = Self::layer_dir(&user_dir, Level::L1);
-        if let Ok(entries) = fs::read_dir(&l1_root) {
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let project_id = entry.file_name().to_string_lossy().to_string();
-                for r in Self::read_records(&entry.path().join("memories.json"))? {
-                    db.records.push(r);
-                }
-                // touch the registry entry so unregistered-but-used projects appear
-                db.projects
-                    .entry(project_id.clone())
-                    .or_insert_with(|| skeleton_project(&project_id));
-            }
-        }
-        for r in Self::read_records(&Self::layer_dir(&user_dir, Level::L2).join("memories.json"))? {
-            db.records.push(r);
-        }
-        for r in Self::read_records(&Self::layer_dir(&user_dir, Level::L3).join("memories.json"))? {
-            db.records.push(r);
-        }
-
-        // similarity links: the text file is authoritative and merges over JSON.
-        // Pairs referencing a not-yet-registered project stay attached to the
-        // known side and activate once that project registers.
-        let links = read_link_file(&Self::layer_dir(&user_dir, Level::L2).join("similar-projects.txt"))?;
-        for (a, b) in links {
-            let has_a = db.projects.contains_key(&a);
-            let has_b = db.projects.contains_key(&b);
-            match (has_a, has_b) {
-                (true, true) => {
-                    if let Some(pa) = db.projects.get_mut(&a) {
-                        if !pa.similar.contains(&b) {
-                            pa.similar.push(b.clone());
-                        }
-                    }
-                    if let Some(pb) = db.projects.get_mut(&b) {
-                        if !pb.similar.contains(&a) {
-                            pb.similar.push(a);
-                        }
-                    }
-                }
-                (true, false) => {
-                    if let Some(pa) = db.projects.get_mut(&a) {
-                        if !pa.similar.contains(&b) {
-                            pa.similar.push(b);
-                        }
-                    }
-                }
-                (false, true) => {
-                    if let Some(pb) = db.projects.get_mut(&b) {
-                        if !pb.similar.contains(&a) {
-                            pb.similar.push(a);
-                        }
-                    }
-                }
-                (false, false) => {} // no side to hold it; both ids unknown
-            }
-        }
-
-        Ok(Some(db))
+    /// JSON-only write (used for L2, whose human-readable layer lives in the
+    /// per-group, per-topic MD files instead of one `memories.md`).
+    fn write_json(dir: &Path, records: &[&MemoryRecord]) -> Result<()> {
+        fs::create_dir_all(dir)
+            .map_err(|e| MemoryError::Storage(format!("create {}: {e}", dir.display())))?;
+        atomic_write(
+            &dir.join("memories.json"),
+            &serde_json::to_vec_pretty(records)?,
+        )?;
+        Ok(())
     }
 
-    fn save(&self, user: &str, db: &UserDb) -> Result<()> {
-        let user_dir = self.user_dir(user)?;
-        fs::create_dir_all(user_dir.join("cache"))
-            .map_err(|e| MemoryError::Storage(format!("create cache dir: {e}")))?;
+    // -- per-section writers (used by save) -----------------------------------
 
-        atomic_write(
-            &self.meta_path(user)?,
-            &serde_json::to_vec_pretty(&Meta {
-                version: db.version,
-                embedder: db.embedder.clone(),
-                dims: db.dims,
-            })?,
-        )?;
-
-        // project registry: write current, drop stale files
+    /// `projects/<id>.json` descriptors: write current, drop stale files.
+    fn write_project_registry(user_dir: &Path, db: &UserDb) -> Result<()> {
         let projects_dir = user_dir.join("projects");
         fs::create_dir_all(&projects_dir)
             .map_err(|e| MemoryError::Storage(format!("create projects dir: {e}")))?;
@@ -381,25 +303,32 @@ impl MemoryStore for LayeredDirStore {
                 }
             }
         }
+        Ok(())
+    }
 
-        // L1: one folder per registered/used project
-        let mut l1_by_project: BTreeMap<String, Vec<&MemoryRecord>> = BTreeMap::new();
+    /// L1: one folder per registered/used project; directories of removed
+    /// projects are reconciled away.
+    fn write_l1_layer(user_dir: &Path, db: &UserDb) -> Result<()> {
+        let mut by_project: BTreeMap<String, Vec<&MemoryRecord>> = BTreeMap::new();
         for r in db.records.iter().filter(|r| r.level == Level::L1) {
             if let Some(pid) = &r.project_id {
-                l1_by_project.entry(pid.clone()).or_default().push(r);
+                by_project.entry(pid.clone()).or_default().push(r);
             }
         }
-        let l1_root = Self::layer_dir(&user_dir, Level::L1);
-        let mut keep_dirs: Vec<String> = l1_by_project.keys().cloned().collect();
+        // registered projects get a folder even with no records (the tree
+        // mirrors the registry)
+        let mut keep_dirs: Vec<String> = by_project.keys().cloned().collect();
         for id in db.projects.keys() {
             if !keep_dirs.contains(id) {
                 keep_dirs.push(id.clone());
             }
         }
+
+        let l1_root = Self::layer_dir(user_dir, Level::L1);
         fs::create_dir_all(&l1_root)?;
         for id in &keep_dirs {
             let empty: Vec<&MemoryRecord> = Vec::new();
-            let records: &[&MemoryRecord] = match l1_by_project.get(id) {
+            let records: &[&MemoryRecord] = match by_project.get(id) {
                 Some(v) => v,
                 None => &empty,
             };
@@ -421,26 +350,134 @@ impl MemoryStore for LayeredDirStore {
                 }
             }
         }
+        Ok(())
+    }
 
-        // L2 and L3
+    /// L2: the flat machine-authoritative JSON plus the human-readable docs —
+    /// no one big file, but per-group and per-topic MDs
+    /// (`groups/<group>/<topic>.md`, e.g. `groups/rust-clis/writing-style.md`;
+    /// records of groupless projects land in `ungrouped/<topic>.md` so every
+    /// L2 record is rendered exactly once) — and the hand-editable
+    /// `groups.txt` membership file (it wins on load).
+    fn write_l2_layer(user_dir: &Path, db: &UserDb) -> Result<()> {
+        let l2_dir = Self::layer_dir(user_dir, Level::L2);
         let l2: Vec<&MemoryRecord> = db.records.iter().filter(|r| r.level == Level::L2).collect();
-        Self::write_records(
-            &Self::layer_dir(&user_dir, Level::L2),
-            "L2 · related projects & components",
-            &db.embedder,
-            &l2,
-        )?;
+        Self::write_json(&l2_dir, &l2)?;
+        Self::write_l2_docs(&l2_dir, db, &l2)?;
+        Self::write_groups_file(&l2_dir, db)?;
+        Ok(())
+    }
 
+    /// Bucket L2 records by (group, topic) and regenerate the MD mirrors.
+    fn write_l2_docs(l2_dir: &Path, db: &UserDb, l2: &[&MemoryRecord]) -> Result<()> {
+        let mut buckets: BTreeMap<Option<String>, BTreeMap<String, Vec<&MemoryRecord>>> =
+            BTreeMap::new();
+        for r in l2 {
+            let topic = r
+                .topic
+                .as_deref()
+                .and_then(normalize_topic)
+                .unwrap_or_else(|| DEFAULT_TOPIC.to_string());
+            buckets
+                .entry(record_group(r, &db.projects))
+                .or_default()
+                .entry(topic)
+                .or_default()
+                .push(r);
+        }
+
+        let groups_root = l2_dir.join("groups");
+        fs::create_dir_all(&groups_root)
+            .map_err(|e| MemoryError::Storage(format!("create {}: {e}", groups_root.display())))?;
+        for (group, topics) in &buckets {
+            let (dir, scope) = match group {
+                Some(g) => (groups_root.join(g), format!("group {g}")),
+                None => (l2_dir.join("ungrouped"), String::from("ungrouped")),
+            };
+            fs::create_dir_all(&dir)
+                .map_err(|e| MemoryError::Storage(format!("create {}: {e}", dir.display())))?;
+            for (topic, records) in topics {
+                let title = format!("L2 · {scope} · {topic}");
+                atomic_write(
+                    &dir.join(format!("{topic}.md")),
+                    render_md(&title, &db.embedder, records).as_bytes(),
+                )?;
+            }
+            // the mirrors are fully generated: drop topic files whose records
+            // all moved away
+            for entry in fs::read_dir(&dir)?.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(stem) = name.strip_suffix(".md") {
+                    if !topics.contains_key(stem) {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        for entry in fs::read_dir(&groups_root)?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if valid_path_segment(&name) && !buckets.contains_key(&Some(name.clone())) {
+                    fs::remove_dir_all(&path).map_err(|e| {
+                        MemoryError::Storage(format!("remove stale group dir {name}: {e}"))
+                    })?;
+                }
+            }
+        }
+        let ungrouped_dir = l2_dir.join("ungrouped");
+        if !buckets.contains_key(&None) && ungrouped_dir.is_dir() {
+            fs::remove_dir_all(&ungrouped_dir)
+                .map_err(|e| MemoryError::Storage(format!("remove stale ungrouped dir: {e}")))?;
+        }
+        // migration: pre-topic single-file L2 mirrors are no longer written
+        let _ = fs::remove_file(l2_dir.join("memories.md"));
+        Ok(())
+    }
+
+    /// `groups.txt`: current assignments ∪ hand-added entries for projects
+    /// that aren't registered (yet). For registered projects the db is
+    /// authoritative here — clear an assignment with `none`, not by deleting
+    /// the line (that just falls back to the project JSON).
+    fn write_groups_file(l2_dir: &Path, db: &UserDb) -> Result<()> {
+        let groups_path = l2_dir.join("groups.txt");
+        let known: HashSet<&str> = db.projects.keys().map(|s| s.as_str()).collect();
+        let mut entries: BTreeMap<String, String> = db
+            .projects
+            .iter()
+            .filter_map(|(id, p)| p.group.clone().map(|g| (id.clone(), g)))
+            .collect();
+        for (pid, g) in read_groups_file(&groups_path)? {
+            if !known.contains(pid.as_str()) {
+                entries.entry(pid).or_insert(g);
+            }
+        }
+        let mut text = String::from(
+            "# tiered-memory · L2 group membership\n\
+             # one per line: <project-id> <group> — hand edits win on load\n\
+             # the reserved group `none` marks a project confirmed to have no group\n",
+        );
+        for (pid, g) in &entries {
+            text.push_str(&format!("{pid} {g}\n"));
+        }
+        atomic_write(&groups_path, text.as_bytes())?;
+        Ok(())
+    }
+
+    /// L3: global traits, one JSON + MD pair.
+    fn write_l3_layer(user_dir: &Path, db: &UserDb) -> Result<()> {
         let l3: Vec<&MemoryRecord> = db.records.iter().filter(|r| r.level == Level::L3).collect();
         Self::write_records(
-            &Self::layer_dir(&user_dir, Level::L3),
+            &Self::layer_dir(user_dir, Level::L3),
             "L3 · learner traits (all projects)",
             &db.embedder,
             &l3,
-        )?;
+        )
+    }
 
-        // similarity links file: existing hand-edits ∪ computed links
-        let link_path = Self::layer_dir(&user_dir, Level::L2).join("similar-projects.txt");
+    /// `similar-projects.txt`: existing hand-edits ∪ computed links.
+    fn write_similar_links(user_dir: &Path, db: &UserDb) -> Result<()> {
+        let link_path = Self::layer_dir(user_dir, Level::L2).join("similar-projects.txt");
         let mut pairs = read_link_file(&link_path)?;
         for p in db.projects.values() {
             for other in &p.similar {
@@ -463,7 +500,153 @@ impl MemoryStore for LayeredDirStore {
             text.push_str(&format!("{a} {b}\n"));
         }
         atomic_write(&link_path, text.as_bytes())?;
+        Ok(())
+    }
 
+    // -- per-section readers (used by load) -----------------------------------
+
+    /// `meta.json`, or `None` when the store has never been written.
+    fn read_meta(&self, user: &str) -> Result<Option<Meta>> {
+        let meta_path = self.meta_path(user)?;
+        match fs::read(&meta_path) {
+            Ok(bytes) => {
+                let meta: Meta = serde_json::from_slice(&bytes).map_err(|e| {
+                    MemoryError::Storage(format!("corrupt {}: {e}", meta_path.display()))
+                })?;
+                Ok(Some(meta))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(MemoryError::Storage(format!(
+                "read {}: {e}",
+                meta_path.display()
+            ))),
+        }
+    }
+
+    /// `projects/<id>.json` descriptors.
+    fn read_project_registry(user_dir: &Path, db: &mut UserDb) -> Result<()> {
+        let projects_dir = user_dir.join("projects");
+        let Ok(entries) = fs::read_dir(&projects_dir) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).map_err(|e| {
+                MemoryError::Storage(format!("read {}: {e}", entry.path().display()))
+            })?;
+            let p: ProjectInfo = serde_json::from_slice(&bytes).map_err(|e| {
+                MemoryError::Storage(format!(
+                    "corrupt project file {}: {e}",
+                    entry.path().display()
+                ))
+            })?;
+            db.projects.insert(p.project_id.clone(), p);
+        }
+        Ok(())
+    }
+
+    /// L1 — one folder per project. Directories without a registry entry
+    /// become skeleton projects, so unregistered-but-used projects appear.
+    fn read_l1_layer(user_dir: &Path, db: &mut UserDb) -> Result<()> {
+        let l1_root = Self::layer_dir(user_dir, Level::L1);
+        let Ok(entries) = fs::read_dir(&l1_root) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let project_id = entry.file_name().to_string_lossy().to_string();
+            let records = Self::read_records(&entry.path().join("memories.json"))?;
+            db.records.extend(records);
+            db.projects
+                .entry(project_id.clone())
+                .or_insert_with(|| skeleton_project(&project_id));
+        }
+        Ok(())
+    }
+
+    /// L2/L3: records live in one flat `memories.json` per layer.
+    fn read_flat_layer(user_dir: &Path, level: Level, db: &mut UserDb) -> Result<()> {
+        let path = Self::layer_dir(user_dir, level).join("memories.json");
+        let records = Self::read_records(&path)?;
+        db.records.extend(records);
+        Ok(())
+    }
+
+    /// Similarity links: the text file is authoritative and merges over JSON.
+    /// Pairs referencing a not-yet-registered project stay attached to the
+    /// known side and activate once that project registers.
+    fn merge_similar_links(user_dir: &Path, db: &mut UserDb) -> Result<()> {
+        let path = Self::layer_dir(user_dir, Level::L2).join("similar-projects.txt");
+        for (a, b) in read_link_file(&path)? {
+            attach_similar(db, &a, &b);
+            attach_similar(db, &b, &a);
+        }
+        Ok(())
+    }
+
+    /// Groups: the text file is authoritative over project JSONs (hand edits
+    /// win on load). Entries for not-yet-registered projects are ignored here
+    /// but preserved on save, activating once they register.
+    fn merge_group_membership(user_dir: &Path, db: &mut UserDb) -> Result<()> {
+        let groups_path = Self::layer_dir(user_dir, Level::L2).join("groups.txt");
+        for (pid, g) in read_groups_file(&groups_path)? {
+            if let Some(p) = db.projects.get_mut(&pid) {
+                p.group = Some(g);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MemoryStore for LayeredDirStore {
+    /// Rebuild the in-memory database from the directory tree. Each section
+    /// has its own reader, mirroring the per-section writers in [`save`](Self::save):
+    /// meta → project registry → L1 folders → L2/L3 JSON → similarity links →
+    /// group membership. Missing files read as empty; only corruption is fatal.
+    fn load(&self, user: &str) -> Result<Option<UserDb>> {
+        let Some(meta) = self.read_meta(user)? else {
+            return Ok(None); // no meta yet — a fresh store
+        };
+        let user_dir = self.user_dir(user)?;
+        let mut db = UserDb::new(meta.embedder, meta.dims);
+
+        Self::read_project_registry(&user_dir, &mut db)?;
+        Self::read_l1_layer(&user_dir, &mut db)?;
+        Self::read_flat_layer(&user_dir, Level::L2, &mut db)?;
+        Self::read_flat_layer(&user_dir, Level::L3, &mut db)?;
+        Self::merge_similar_links(&user_dir, &mut db)?;
+        Self::merge_group_membership(&user_dir, &mut db)?;
+
+        Ok(Some(db))
+    }
+
+    /// Persist the whole user database. Each layer/section has its own writer
+    /// so this stays a readable map of the on-disk layout:
+    /// meta → project registry → L1 folders → L2 (flat JSON + per-topic docs
+    /// + membership file) → L3 → similarity links.
+    fn save(&self, user: &str, db: &UserDb) -> Result<()> {
+        let user_dir = self.user_dir(user)?;
+        fs::create_dir_all(user_dir.join("cache"))
+            .map_err(|e| MemoryError::Storage(format!("create cache dir: {e}")))?;
+
+        atomic_write(
+            &self.meta_path(user)?,
+            &serde_json::to_vec_pretty(&Meta {
+                version: db.version,
+                embedder: db.embedder.clone(),
+                dims: db.dims,
+            })?,
+        )?;
+        Self::write_project_registry(&user_dir, db)?;
+        Self::write_l1_layer(&user_dir, db)?;
+        Self::write_l2_layer(&user_dir, db)?;
+        Self::write_l3_layer(&user_dir, db)?;
+        Self::write_similar_links(&user_dir, db)?;
         Ok(())
     }
 
@@ -495,6 +678,7 @@ fn skeleton_project(project_id: &str) -> ProjectInfo {
         descriptor: project_id.to_string(),
         descriptor_vector: Vec::new(),
         similar: Vec::new(),
+        group: None,
         created_at_ms: crate::engine::system_now_ms(),
     }
 }
@@ -503,7 +687,12 @@ fn read_link_file(path: &Path) -> Result<Vec<(String, String)>> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(MemoryError::Storage(format!("read {}: {e}", path.display()))),
+        Err(e) => {
+            return Err(MemoryError::Storage(format!(
+                "read {}: {e}",
+                path.display()
+            )))
+        }
     };
     let mut pairs = Vec::new();
     for line in text.lines() {
@@ -525,6 +714,66 @@ fn read_link_file(path: &Path) -> Result<Vec<(String, String)>> {
     pairs.sort();
     pairs.dedup();
     Ok(pairs)
+}
+
+/// The L2 mirror bucket for one record: its explicit group, else its owning
+/// project's group, else `None` (rendered under `ungrouped/`). Shared by the
+/// store's own save() and the console's group views.
+pub(crate) fn record_group(
+    r: &MemoryRecord,
+    projects: &BTreeMap<String, ProjectInfo>,
+) -> Option<String> {
+    if let Some(g) = r.group.as_deref().filter(|g| *g != crate::engine::NO_GROUP) {
+        return Some(g.to_string());
+    }
+    r.project_id
+        .as_deref()
+        .and_then(|pid| projects.get(pid))
+        .and_then(|p| p.group.as_deref())
+        .filter(|g| *g != crate::engine::NO_GROUP)
+        .map(|g| g.to_string())
+}
+
+/// Attach `other` to `project`'s similar list if that project is registered
+/// (unregistered ids have no side to hold the link yet).
+fn attach_similar(db: &mut UserDb, project: &str, other: &str) {
+    if let Some(p) = db.projects.get_mut(project) {
+        if !p.similar.iter().any(|s| s == other) {
+            p.similar.push(other.to_string());
+        }
+    }
+}
+
+fn read_groups_file(path: &Path) -> Result<Vec<(String, String)>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(MemoryError::Storage(format!(
+                "read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let (Some(pid), Some(g)) = (tokens.next(), tokens.next()) else {
+            continue;
+        };
+        // `none` is a meaningful value (explicit no-group confirmation)
+        if !valid_path_segment(pid) || !valid_path_segment(g) {
+            continue;
+        }
+        out.push((pid.to_string(), g.to_string()));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Human-readable mirror of one layer's records. Regenerated on every write —
@@ -616,6 +865,8 @@ mod tests {
             vector: vec![0.5],
             level,
             project_id: project.map(|p| p.into()),
+            group: None,
+            topic: None,
             kind: MemoryKind::Preference,
             params: BTreeMap::new(),
             key_hint: None,
@@ -646,6 +897,7 @@ mod tests {
                 descriptor: "tutoring app".into(),
                 descriptor_vector: vec![],
                 similar: vec!["music".into()],
+                group: None,
                 created_at_ms: 1,
             },
         );
@@ -659,24 +911,34 @@ mod tests {
                 descriptor: "piano".into(),
                 descriptor_vector: vec![],
                 similar: vec!["teacher".into()],
+                group: None,
                 created_at_ms: 1,
             },
         );
-        db.records.push(record(Level::L1, Some("teacher"), "hot line"));
-        db.records.push(record(Level::L2, Some("teacher"), "warm line"));
+        db.records
+            .push(record(Level::L1, Some("teacher"), "hot line"));
+        db.records
+            .push(record(Level::L2, Some("teacher"), "warm line"));
         db.records.push(record(Level::L3, None, "global trait"));
         store.save(LOCAL_USER, &db).unwrap();
 
-        // layout: L1 per project, L2 big file + links, L3 user-level
+        // layout: L1 per project, L2 flat JSON + per-topic docs, L3 user-level
         let root = dir.path();
         assert!(root.join("cache/L1/teacher/memories.json").is_file());
         assert!(root.join("cache/L1/teacher/memories.md").is_file());
         assert!(root.join("cache/L2/memories.json").is_file());
-        assert!(root.join("cache/L2/memories.md").is_file());
+        assert!(
+            !root.join("cache/L2/memories.md").exists(),
+            "L2 has no single big md file"
+        );
+        assert!(root.join("cache/L2/ungrouped/general.md").is_file());
         assert!(root.join("cache/L2/similar-projects.txt").is_file());
         assert!(root.join("cache/L3/memories.md").is_file());
         assert!(root.join("projects/teacher.json").is_file());
-        assert!(!root.join("users").exists(), "`local` user stays at the root");
+        assert!(
+            !root.join("users").exists(),
+            "`local` user stays at the root"
+        );
 
         let md = fs::read_to_string(root.join("cache/L1/teacher/memories.md")).unwrap();
         assert!(md.contains("hot line"), "mirror must contain the text");
@@ -686,7 +948,9 @@ mod tests {
         assert_eq!(roundtripped.count_in(Level::L1), 1);
         assert_eq!(roundtripped.embedder, "hashing:512");
         // links from ProjectInfo are written to the text file and survive load
-        assert!(roundtripped.projects["teacher"].similar.contains(&"music".into()));
+        assert!(roundtripped.projects["teacher"]
+            .similar
+            .contains(&"music".into()));
     }
 
     #[test]
@@ -705,6 +969,7 @@ mod tests {
                 descriptor: "alpha".into(),
                 descriptor_vector: vec![],
                 similar: vec![],
+                group: None,
                 created_at_ms: 1,
             },
         );
@@ -722,6 +987,80 @@ mod tests {
 
         let loaded = store.load(LOCAL_USER).unwrap().unwrap();
         assert!(loaded.projects["a"].similar.contains(&"games".into()));
+    }
+
+    #[test]
+    fn groups_membership_file_and_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LayeredDirStore::new(dir.path()).unwrap();
+
+        let mut db = UserDb::new("hashing:512".into(), 512);
+        for (id, group) in [("a", Some("g1")), ("b", Some("g1")), ("c", None)] {
+            db.projects.insert(
+                id.into(),
+                ProjectInfo {
+                    project_id: id.into(),
+                    name: id.into(),
+                    tags: vec![],
+                    components: vec![],
+                    descriptor: id.into(),
+                    descriptor_vector: vec![],
+                    similar: vec![],
+                    group: group.map(|g| g.to_string()),
+                    created_at_ms: 1,
+                },
+            );
+        }
+        let mut clap_pref = record(Level::L2, Some("a"), "shared clap preference");
+        clap_pref.topic = Some("tooling".into());
+        db.records.push(clap_pref);
+        let mut group_owned = record(Level::L2, None, "group-wide convention");
+        group_owned.group = Some("g1".into());
+        group_owned.topic = Some("preferences".into());
+        db.records.push(group_owned);
+        db.records
+            .push(record(Level::L2, Some("c"), "ungrouped note"));
+        store.save(LOCAL_USER, &db).unwrap();
+
+        let root = dir.path();
+        let links = fs::read_to_string(root.join("cache/L2/groups.txt")).unwrap();
+        assert!(links.lines().any(|l| l == "a g1"), "{links}");
+        assert!(links.lines().any(|l| l == "b g1"), "{links}");
+        assert!(
+            !links.lines().any(|l| l.starts_with("c ")),
+            "projects without groups are not listed: {links}"
+        );
+
+        // per-topic mirrors inside the group dir
+        let tooling = fs::read_to_string(root.join("cache/L2/groups/g1/tooling.md")).unwrap();
+        assert!(tooling.contains("shared clap preference"));
+        assert!(
+            !tooling.contains("group-wide convention"),
+            "topics split into separate files"
+        );
+        let prefs = fs::read_to_string(root.join("cache/L2/groups/g1/preferences.md")).unwrap();
+        assert!(prefs.contains("group-wide convention"));
+        // untopic'd, ungrouped records land in ungrouped/<default-topic>.md
+        let ungrouped = fs::read_to_string(root.join("cache/L2/ungrouped/general.md")).unwrap();
+        assert!(ungrouped.contains("ungrouped note"));
+        assert!(
+            !root.join("cache/L2/memories.md").exists(),
+            "L2 is no longer one big md file"
+        );
+        assert!(!root.join("cache/L2/groups/g1/memories.md").exists());
+
+        // a topic file whose records all move away is cleaned up
+        fs::write(root.join("cache/L2/groups/g1/stale.md"), "# stale\n").unwrap();
+        store.save(LOCAL_USER, &db).unwrap();
+        assert!(!root.join("cache/L2/groups/g1/stale.md").exists());
+
+        // hand edits in the file win on load
+        let path = root.join("cache/L2/groups.txt");
+        let text = fs::read_to_string(&path).unwrap().replace("b g1", "b g2");
+        fs::write(&path, text).unwrap();
+        let loaded = store.load(LOCAL_USER).unwrap().unwrap();
+        assert_eq!(loaded.projects["b"].group.as_deref(), Some("g2"));
+        assert_eq!(loaded.projects["a"].group.as_deref(), Some("g1"));
     }
 
     #[test]
@@ -767,6 +1106,7 @@ mod tests {
                 descriptor: "a".into(),
                 descriptor_vector: vec![],
                 similar: vec![],
+                group: None,
                 created_at_ms: 1,
             },
         );
