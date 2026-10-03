@@ -199,9 +199,9 @@ tiered-memory serve        # the HTTP service (default command)
 Inside an init'ed project, `remember` / `recall` / `params` resolve the
 project from the local `tiered-memory.json` marker — no flags needed.
 
-Write commands (`init`, `remember`) go **through the running service when one
-is up** and fall back to writing the local store directly when it isn't, so
-the CLI and a live `serve` never disagree.
+Write commands (`init`, `remember`, `sync`) go **through the running service
+when one is up** and fall back to writing the local store directly when it
+isn't, so the CLI and a live `serve` never disagree.
 
 ### Using it from a non-Rust project
 
@@ -215,6 +215,53 @@ Two ways, both dependency-free:
 
 `tiered-memory init` in the project gives both modes the project id; the
 `tiered-memory.json` it writes is the discovery file for host applications.
+
+## The `/tiered-memory` agent skill
+
+The repo ships a harness-ready skill package (`skill/SKILL.md`) that teaches
+any agent runtime to run the full update pass: **gather** the current state of
+all three layers, **extract** new or changed knowledge from the session with
+one LLM call, and **write it back** into the right layers.
+
+```bash
+tiered-memory install-skill          # → ~/.agents/skills/tiered-memory/SKILL.md
+tiered-memory install-skill --dir /path/to/skills   # any other harness dir
+```
+
+Then invoke it as `/tiered-memory` (or "update my memory") from the harness.
+Under the hood it runs:
+
+```bash
+tiered-memory sync --stdin <<'EOF'
+<the session transcript>
+EOF
+# gathers L1+L2+L3 → one OpenAI-compatible LLM call extracts updates →
+# writes each into L1 (project), L2 (related scopes) or L3 (global traits)
+# and prints what landed, per layer, plus the adjusted parameters after
+```
+
+Use `--dry-run` to preview without writing, `--file <path>` / quoted text for
+input, and `--credentials <file>` to point at an alternative credentials file.
+The skill is embedded in the binary at compile time, so `install-skill` always
+installs the version matching the installed release — re-run it after
+upgrading.
+
+### LLM credentials (OpenAI-compatible)
+
+`sync` talks to any OpenAI-compatible `/chat/completions` endpoint — OpenAI,
+OpenRouter, Groq, Ollama (`http://localhost:11434/v1`), LM Studio, vLLM:
+
+```bash
+tiered-memory credentials set --base-url https://api.openai.com/v1 \
+    --api-key sk-... --model gpt-4o-mini
+tiered-memory credentials show     # masked
+tiered-memory credentials clear
+```
+
+Credentials persist in `{data}/credentials.json` (written `0600`); the
+`TM_LLM_BASE_URL` / `TM_LLM_API_KEY` / `TM_LLM_MODEL` env vars also work.
+Without credentials the skill still works — the SKILL.md instructs the agent
+to fall back to routing memories itself via `remember --global` / `--level`.
 
 ### Auth (opt-in, sized for a standalone binary)
 

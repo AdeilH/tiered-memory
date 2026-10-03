@@ -20,7 +20,7 @@
 //! `remember`/`recall`. Write commands go through the running service when it
 //! is reachable (HTTP-first) so a live service and CLI writes never go stale.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiered_memory::{
@@ -39,6 +39,9 @@ async fn main() {
         Some("params") => params(),
         Some("remember") => remember(),
         Some("recall") => recall(),
+        Some("sync") => sync_cmd(),
+        Some("credentials") => credentials(),
+        Some("install-skill") => install_skill(),
         Some("stats") => stats(),
         Some("help") | Some("--help") | Some("-h") => {
             print_usage();
@@ -71,6 +74,15 @@ USAGE:
                                          store a memory
   tiered-memory recall \"query\" [--project P] [--k N] [--min F] [--user U]
                                          layered search
+  tiered-memory sync [--file F | --text T | --stdin] [--project P] [--user U]
+                     [--credentials FILE] [--dry-run]
+                                         gather all 3 layers, extract new/changed
+                                         knowledge with the configured LLM, write it
+                                         back into the right layers
+  tiered-memory credentials set --base-url U --api-key K --model M
+  tiered-memory credentials show | clear  OpenAI-compatible LLM credentials
+  tiered-memory install-skill [--dir D]   install the /tiered-memory agent skill
+                                         (default dir: ~/.agents/skills)
   tiered-memory stats   [--user U]       per-layer counts vs capacity
 
 Non-Rust projects use the installed binary two ways: HTTP (serve + any client)
@@ -695,6 +707,252 @@ fn params() -> Result<(), String> {
                 .join(", ")
         );
     }
+    Ok(())
+}
+
+// -- sync --------------------------------------------------------------------
+
+/// The `/tiered-memory` update pass: gather all three layers, extract new or
+/// changed knowledge from the given conversation with the configured
+/// OpenAI-compatible LLM, and write it back into the right layers. Applies
+/// through the running service when one is up (same policy as `remember`).
+fn sync_cmd() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let user = arg_value(&args, "--user").unwrap_or_else(default_user);
+    let project = resolve_project(&args, &user)?;
+
+    let conversation = if arg_switch(&args, "--stdin") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        buf
+    } else if let Some(path) = arg_value(&args, "--file") {
+        std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?
+    } else {
+        positional(&args).ok_or(
+            "give the conversation via --file <path>, --stdin, or as a quoted argument",
+        )?
+    };
+
+    let credentials_path = arg_value(&args, "--credentials").map(PathBuf::from);
+    let config = tiered_memory::LlmConfig::resolve(
+        credentials_path.as_deref(),
+        &data_root(),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| {
+        "no LLM credentials — run `tiered-memory credentials set --base-url … --api-key … --model …` (or pass --credentials FILE)".to_string()
+    })?;
+    let llm = tiered_memory::LlmClient::new(config).map_err(|e| e.to_string())?;
+
+    let input = tiered_memory::SyncInput {
+        user: user.clone(),
+        project_id: project.clone(),
+        conversation,
+    };
+    let engine = local_engine()?;
+    let plan = tiered_memory::plan(&engine, &llm, &input).map_err(|e| e.to_string())?;
+
+    if plan.entries.is_empty() {
+        println!("sync: nothing new to store — all layers already cover this conversation");
+        return Ok(());
+    }
+    if arg_switch(&args, "--dry-run") {
+        println!("sync plan (dry run) for `{user}` · `{project}`:");
+        for e in &plan.entries {
+            println!("  [{:?}] {}{}", e.level, e.text, fmt_params(&e.params));
+        }
+        return Ok(());
+    }
+
+    // HTTP-first: route each entry through the running service when reachable.
+    let mut report = tiered_memory::SyncReport {
+        raw_model_reply: plan.raw_model_reply.clone(),
+        ..Default::default()
+    };
+    for entry in &plan.entries {
+        let body = serde_json::json!({
+            "user": user,
+            "text": entry.text,
+            "project_id": if entry.level == tiered_memory::Level::L3 { None } else { Some(&project) },
+            "level": entry.level,
+            "params": if entry.params.is_empty() { None } else { Some(entry.params.clone()) },
+            "key_hint": entry.key,
+            "confidence": entry.confidence,
+        });
+        match api_post("/v1/remember", &body) {
+            Api::Ok(_) => report.stored.push(entry.clone()),
+            Api::Err(e) => report.skipped.push(e),
+            Api::Unreachable => {
+                // fall back to direct writes on the SAME engine so its cache
+                // stays coherent for the params_after read below
+                match engine.remember(tiered_memory::RememberInput {
+                    user: user.clone(),
+                    text: entry.text.clone(),
+                    project_id: if entry.level == tiered_memory::Level::L3 {
+                        None
+                    } else {
+                        Some(project.clone())
+                    },
+                    kind: None,
+                    params: if entry.params.is_empty() {
+                        None
+                    } else {
+                        Some(entry.params.clone())
+                    },
+                    key_hint: entry.key.clone(),
+                    confidence: Some(entry.confidence),
+                    pinned: None,
+                    ttl_days: None,
+                    level: Some(entry.level),
+                }) {
+                    Ok(_) => report.stored.push(entry.clone()),
+                    Err(e) => report.skipped.push(format!("{} ({e})", entry.text)),
+                }
+            }
+        }
+    }
+    for s in engine
+        .adjusted_parameters(&user, Some(&project))
+        .map_err(|e| e.to_string())?
+    {
+        report.params_after.insert(s.key, s.value);
+    }
+
+    println!(
+        "sync for `{user}` · `{project}`: {} stored, {} skipped",
+        report.stored.len(),
+        report.skipped.len()
+    );
+    for e in &report.stored {
+        println!("  [{:?}] {}{}", e.level, e.text, fmt_params(&e.params));
+    }
+    for s in &report.skipped {
+        println!("  (skipped) {s}");
+    }
+    if !report.params_after.is_empty() {
+        println!("\nadjusted parameters now:");
+        for (k, v) in &report.params_after {
+            println!("  {k} = {}", v.as_text());
+        }
+    }
+    Ok(())
+}
+
+fn fmt_params(params: &std::collections::BTreeMap<String, tiered_memory::ParamValue>) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let pairs: Vec<String> = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", v.as_text()))
+        .collect();
+    format!(" {{{}}}", pairs.join(", "))
+}
+
+// -- credentials ---------------------------------------------------------------
+
+fn credentials() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let sub = args.first().map(String::as_str).unwrap_or("show");
+    let path = data_root().join(tiered_memory::CREDENTIALS_FILE);
+
+    match sub {
+        "set" => {
+            let mut config = tiered_memory::LlmConfig::load_from(&path)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            if let Some(v) = arg_value(&args, "--base-url") {
+                config.base_url = v;
+            }
+            if let Some(v) = arg_value(&args, "--api-key") {
+                config.api_key = Some(v);
+            }
+            if let Some(v) = arg_value(&args, "--model") {
+                config.model = v;
+            }
+            if let Some(v) = arg_value(&args, "--temperature") {
+                config.temperature = v.parse::<f32>().ok();
+            }
+            config.save_to(&path).map_err(|e| e.to_string())?;
+            println!("credentials written to {}", path.display());
+            println!("  base_url: {}", config.base_url);
+            println!("  model:    {}", config.model);
+            println!(
+                "  api_key:  {}",
+                mask_key(config.api_key.as_deref().unwrap_or("(none)"))
+            );
+        }
+        "show" => {
+            let config = tiered_memory::LlmConfig::resolve(None, &data_root())
+                .map_err(|e| e.to_string())?;
+            match config {
+                Some(c) => {
+                    let source = if path.is_file() {
+                        path.display().to_string()
+                    } else {
+                        "environment (TM_LLM_*)".to_string()
+                    };
+                    println!("LLM credentials (from {source}):");
+                    println!("  base_url: {}", c.base_url);
+                    println!("  model:    {}", c.model);
+                    println!(
+                        "  api_key:  {}",
+                        mask_key(c.api_key.as_deref().unwrap_or("(none)"))
+                    );
+                }
+                None => {
+                    println!("no LLM credentials configured.");
+                    println!("set them with:");
+                    println!(
+                        "  tiered-memory credentials set --base-url https://api.openai.com/v1 \\"
+                    );
+                    println!("      --api-key sk-... --model gpt-4o-mini");
+                    println!("(any OpenAI-compatible provider works; env vars TM_LLM_BASE_URL / TM_LLM_API_KEY / TM_LLM_MODEL also work)");
+                }
+            }
+        }
+        "clear" => {
+            match std::fs::remove_file(&path) {
+                Ok(_) => println!("credentials removed ({})", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no credentials file at {}", path.display())
+                }
+                Err(e) => return Err(format!("remove {}: {e}", path.display())),
+            }
+        }
+        other => return Err(format!("unknown credentials subcommand `{other}` (set | show | clear)")),
+    }
+    Ok(())
+}
+
+fn mask_key(key: &str) -> String {
+    if key.len() <= 8 {
+        return "*".repeat(key.len());
+    }
+    format!("{}…{}", &key[..4], &key[key.len() - 2..])
+}
+
+// -- install-skill -----------------------------------------------------------
+
+/// Install the bundled `/tiered-memory` agent skill into a harness skills
+/// directory. Overwrites any previous copy — re-run after upgrading.
+fn install_skill() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let default_dir = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".agents").join("skills"))
+        .unwrap_or_else(|_| PathBuf::from(".agents/skills"));
+    let dir = arg_value(&args, "--dir")
+        .map(PathBuf::from)
+        .unwrap_or(default_dir);
+    let target = dir.join("tiered-memory");
+    std::fs::create_dir_all(&target).map_err(|e| format!("create {}: {e}", target.display()))?;
+    let skill = include_str!("../../skill/SKILL.md");
+    let path = target.join("SKILL.md");
+    std::fs::write(&path, skill).map_err(|e| format!("write {}: {e}", path.display()))?;
+    println!("skill installed: {}", path.display());
+    println!("the `/tiered-memory` skill is now available to harnesses that load ~/.agents/skills (restart/refresh the harness if it caches its skill list)");
     Ok(())
 }
 

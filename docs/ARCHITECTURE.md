@@ -237,3 +237,27 @@ simple embeddable setups and tests; same trait, same engine.
   `memories.md` are overwritten (edit via API/CLI; `similar-projects.txt` is
   the hand-editable exception).
 - No audit log; `forget` is a hard delete (it's the point).
+
+## 10. LLM-assisted sync (`tiered-memory sync`)
+
+The `/tiered-memory` skill drives a three-step pipeline (lib: `sync::plan` +
+`sync::apply`, so callers can preview or route the writes elsewhere):
+
+1. **Gather** — `MemoryEngine::memory_context` collects the visible lines of
+   all three layers (L1 of the project, L2 of related scopes, L3 global) plus
+   the adjusted parameters, capped per layer, vectors stripped.
+2. **Extract** — one chat completion against any OpenAI-compatible endpoint
+   (`LlmClient`; credentials from `{data}/credentials.json` written 0600, or
+   `TM_LLM_*` env, or an explicit `--credentials` file). The system prompt
+   restates the layer semantics, shows the current state so known facts are
+   not re-asserted, and demands a strict JSON `{"updates": […]}` reply.
+3. **Apply** — every update goes through the engine's normal `remember` path
+   (explicit level, typed `params`, optional `key`): key upserts, content
+   dedupe, capacity and persistence all apply unchanged. Unknown levels and
+   empty texts are dropped at plan time; failures surface as `skipped`.
+
+Because extraction is a normal LLM call, the routing quality is bounded by the
+model, but the engine stays the source of truth: the LLM can only propose
+memories, and every invariant (visibility, precedence, capacity, expiry) is
+enforced by the same code paths as direct writes. The CLI applies through the
+running service when reachable (same HTTP-first policy as `remember`).

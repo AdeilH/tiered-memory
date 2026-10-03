@@ -296,6 +296,28 @@ pub struct HealthInfo {
     pub users: usize,
 }
 
+/// One memory line as handed to the sync gather step (no vectors).
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryLine {
+    pub id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_hint: Option<String>,
+    pub confidence: f32,
+    pub pinned: bool,
+}
+
+/// The gathered state of all three layers for one project scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryContext {
+    pub l1: Vec<MemoryLine>,
+    pub l2: Vec<MemoryLine>,
+    pub l3: Vec<MemoryLine>,
+    pub params: Vec<ParamSuggestion>,
+}
+
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
@@ -873,6 +895,59 @@ impl MemoryEngine {
             out.insert(s.key, s.value);
         }
         Ok(out)
+    }
+
+    /// Everything currently held across the three layers for one project
+    /// scope — the "gather" half of the sync pipeline and useful for prompt
+    /// injection. L1: this project's hot lines. L2: related scopes (sibling
+    /// components + similar projects). L3: user-level traits. Capped per
+    /// layer (most recently used first) so prompts stay bounded.
+    pub fn memory_context(
+        &self,
+        user: &str,
+        project_id: Option<&str>,
+        per_layer_cap: usize,
+    ) -> Result<MemoryContext> {
+        let now = (self.config.now)();
+        let dba = self.user_db(user)?;
+        let db = lock(&dba)?;
+        let similar: HashSet<String> = project_id
+            .and_then(|p| db.projects.get(p))
+            .map(|pi| pi.similar.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut by_layer: BTreeMap<Level, Vec<MemoryLine>> = BTreeMap::new();
+        for r in db
+            .records
+            .iter()
+            .filter(|r| !r.is_expired(now) && visible_at(r, project_id, &similar))
+        {
+            by_layer.entry(r.level).or_default().push(MemoryLine {
+                id: r.id.clone(),
+                text: r.text.clone(),
+                params: r.params.clone(),
+                key_hint: r.key_hint.clone(),
+                confidence: r.confidence,
+                pinned: r.pinned,
+            });
+        }
+        for lines in by_layer.values_mut() {
+            lines.truncate(per_layer_cap.max(1));
+        }
+        Ok(MemoryContext {
+            l1: by_layer.remove(&Level::L1).unwrap_or_default(),
+            l2: by_layer.remove(&Level::L2).unwrap_or_default(),
+            l3: by_layer.remove(&Level::L3).unwrap_or_default(),
+            params: params::collect_suggestions(
+                &db.records
+                    .iter()
+                    .filter(|r| !r.is_expired(now) && visible_at(r, project_id, &similar))
+                    .collect::<Vec<_>>(),
+                now,
+                self.config.half_life_days,
+                self.config.numeric_param_tolerance,
+            ),
+        })
     }
 
     // -- maintenance ---------------------------------------------------------

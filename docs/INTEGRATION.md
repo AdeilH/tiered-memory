@@ -121,6 +121,23 @@ Learner profile (from memory):
 - relevant: [L1] In this project the learner wants pure theory, no code examples
 ```
 
+## Agent-harness integration: the `/tiered-memory` skill
+
+For agent harnesses that load skills, the binary can install a ready-made
+skill package (canonical source: `skill/SKILL.md` in the repo, embedded in the
+binary at build time):
+
+```bash
+tiered-memory install-skill                 # → ~/.agents/skills/tiered-memory/SKILL.md
+tiered-memory install-skill --dir <harness-skills-dir>
+```
+
+Invoking `/tiered-memory` in a session makes the agent gather all three layers
+(`params` + `recall` + `stats`), pipe the session transcript into
+`tiered-memory sync --stdin` (which extracts new/changed knowledge with the
+configured OpenAI-compatible LLM and writes it back into L1/L2/L3), and report
+what landed. Configure the LLM once with `tiered-memory credentials set`.
+
 ## Shell-out integration (no HTTP at all)
 
 For scripts and build tools, the CLI is a complete interface:

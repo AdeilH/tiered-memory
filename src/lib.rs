@@ -48,6 +48,11 @@ pub mod vector;
 
 #[cfg(feature = "server")]
 pub mod api;
+// LLM-assisted memory sync (OpenAI-compatible extraction) + its client.
+#[cfg(feature = "server")]
+pub mod llm;
+#[cfg(feature = "server")]
+pub mod sync;
 
 #[cfg(feature = "http")]
 pub use embed::http::HttpEmbedder;
@@ -56,8 +61,8 @@ pub use embed::local::{LocalEmbedder, LocalEmbedderConfig};
 pub use embed::{Embedder, EmbedderConfig};
 pub use engine::{
     system_now_ms, ConsolidationReport, Counts, EngineConfig, EngineStats, FeedbackInput,
-    ForgetInput, HealthInfo, MemoryEngine, NowFn, ProjectInput, RecallHit, RecallInput,
-    RecallOutput, RememberInput, RememberOutcome,
+    ForgetInput, HealthInfo, MemoryContext, MemoryEngine, MemoryLine, NowFn, ProjectInput,
+    RecallHit, RecallInput, RecallOutput, RememberInput, RememberOutcome,
 };
 pub use error::{MemoryError, Result};
 pub use params::{ParamAlternative, ParamSuggestion};
@@ -66,6 +71,10 @@ pub use types::{Level, MemoryKind, MemoryRecord, ParamValue, ProjectInfo, UserDb
 
 #[cfg(feature = "server")]
 pub use api::{build_router, ServerState};
+#[cfg(feature = "server")]
+pub use llm::{LlmClient, LlmConfig, CREDENTIALS_FILE};
+#[cfg(feature = "server")]
+pub use sync::{apply, plan, sync, SyncEntry, SyncInput, SyncPlan, SyncReport};
 
 /// Default HTTP bind address for the bundled server.
 pub const DEFAULT_BIND: &str = "127.0.0.1:7900";
