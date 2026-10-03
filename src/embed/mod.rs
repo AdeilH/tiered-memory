@@ -23,7 +23,7 @@ pub use local::{LocalEmbedder, LocalEmbedderConfig};
 
 use crate::error::{MemoryError, Result};
 use serde::Deserialize;
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local", feature = "http"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -127,7 +127,7 @@ impl EmbedderConfig {
                 api_key.clone(),
                 model.clone(),
                 *dims,
-            ))),
+            )?) as Arc<dyn Embedder>),
         }
     }
 
@@ -173,7 +173,7 @@ impl EmbedderConfig {
                     Some(c) if !c.base_url.trim().is_empty() => Ok(EmbedderConfig::Http {
                         url: c.base_url,
                         api_key: c.api_key,
-                        model: c.model,
+                        model: (!c.model.trim().is_empty()).then_some(c.model),
                         dims: None, // probed from the first response
                     }),
                     _ => Err(MemoryError::Embedder(
