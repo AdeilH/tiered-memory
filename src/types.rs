@@ -157,6 +157,21 @@ impl MemoryRecord {
         self.origin.as_deref().unwrap_or(&self.id)
     }
 
+    /// The layer this record *serves at* for a viewer in `project`. A used
+    /// project's L1 lines are visible cross-project, but they are not the
+    /// viewer's own hot line — they surface from the warm (L2) tier, keeping
+    /// "L1 in the output = this project's hot line" true everywhere.
+    pub fn serving_level_for(&self, project: Option<&str>) -> Level {
+        if self.level == Level::L1
+            && self.project_id.is_some()
+            && self.project_id.as_deref() != project
+        {
+            Level::L2
+        } else {
+            self.level
+        }
+    }
+
     pub fn is_expired(&self, now_ms: u64) -> bool {
         !self.pinned && self.expires_at_ms.map(|t| t <= now_ms).unwrap_or(false)
     }
@@ -181,6 +196,12 @@ pub struct ProjectInfo {
     /// Project ids whose L2 memories surface when recalling for this project.
     #[serde(default)]
     pub similar: Vec<String>,
+    /// Project ids this project explicitly **uses**: their L1 *and* L2
+    /// memories surface here (serving from the warm L2 tier). Directional —
+    /// `b.uses = [a]` lets b see a's memories, never the reverse. User-managed
+    /// via `tiered-memory use <project>` / the hand-editable `uses.txt`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
     /// The project's L2 group (a family of projects sharing warm memories,
     /// e.g. `rust-clis`). The reserved value `none` means the user explicitly
     /// confirmed this project belongs to no group — don't ask again.

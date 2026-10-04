@@ -82,14 +82,23 @@ impl Drop for RawGuard {
     }
 }
 
-fn width() -> u16 {
+/// Terminal width in columns, capped at 120 (the widest layout the wizards
+/// draw). Shared with `harnesses.rs`'s picker so rows never exceed the screen.
+pub(crate) fn width() -> u16 {
     crossterm::terminal::size()
         .map(|(w, _)| w)
         .unwrap_or(80)
         .min(120)
 }
 
-fn trunc(s: &str, max: u16) -> String {
+/// Terminal height in rows.
+pub(crate) fn height() -> u16 {
+    crossterm::terminal::size()
+        .map(|(_, h)| h)
+        .unwrap_or(24)
+}
+
+pub(crate) fn trunc(s: &str, max: u16) -> String {
     let max = max as usize;
     if s.chars().count() <= max {
         s.to_string()
@@ -100,7 +109,7 @@ fn trunc(s: &str, max: u16) -> String {
 }
 
 /// Draw one line with optional color and emphasis, clearing the rest of it.
-fn draw(y: u16, text: &str, fg: Option<Color>, emphasis: Option<Attribute>) {
+pub(crate) fn draw(y: u16, text: &str, fg: Option<Color>, emphasis: Option<Attribute>) {
     let _ = execute!(
         stdout(),
         MoveTo(0, y),
@@ -113,11 +122,11 @@ fn draw(y: u16, text: &str, fg: Option<Color>, emphasis: Option<Attribute>) {
     );
 }
 
-fn clear_screen() {
+pub(crate) fn clear_screen() {
     let _ = execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0));
 }
 
-fn header(title: &str) {
+pub(crate) fn header(title: &str) {
     draw(
         0,
         &format!(" tiered-memory · {title} "),
@@ -357,7 +366,7 @@ pub fn input_line(
 }
 
 /// Wait for a key/resize event without busy-looping.
-fn event_available() -> Result<bool> {
+pub(crate) fn event_available() -> Result<bool> {
     poll(Duration::from_millis(250)).map_err(|e| MemoryError::invalid(format!("terminal: {e}")))
 }
 

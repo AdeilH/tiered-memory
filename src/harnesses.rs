@@ -322,6 +322,21 @@ fn parse_user_harness(u: UserHarness) -> std::result::Result<Harness, String> {
     if u.target.trim().is_empty() {
         return Err(format!("harness `{}` needs a non-empty target", u.id));
     }
+    // targets anchor at $HOME or the project — a synced/imported store can
+    // carry a harnesses.json the user never vetted, so a target like
+    // `../../.ssh` or an absolute path must never turn install/uninstall into
+    // arbitrary path writes
+    let target = Path::new(u.target.trim());
+    if target.is_absolute()
+        || target
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "harness `{}`: target must be relative to its scope and cannot contain `..`",
+            u.id
+        ));
+    }
     let mode = match u.mode.as_str() {
         "skill-dir" => InstallMode::SkillDir,
         "agents-md" => InstallMode::AgentsMd,
@@ -640,101 +655,204 @@ fn parse_description(skill_md: &str) -> Option<String> {
 /// Multi-select harness picker (↑/↓ move, space toggles, `a` toggles all,
 /// Enter confirms, Esc cancels → `None`). Detected harnesses are listed and
 /// pre-highlighted first.
+///
+/// Drawn with the shared `tui` helpers: rows are trimmed to the terminal's
+/// real width and only a window of items is shown, so narrow or short
+/// terminals can't wrap/scroll a frame into garbage.
 pub fn pick_harnesses(home: &Path, cwd: &Path) -> Result<Option<Vec<&'static Harness>>> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::style::Stylize;
+    use crate::tui::{clear_screen, draw, event_available, header, height, trunc, width};
+    use crossterm::cursor::MoveTo;
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::style::{Attribute, Color, Print, ResetColor, SetForegroundColor};
+    use crossterm::terminal::{Clear, ClearType::UntilNewLine};
     use std::io::{stdout, Write};
+
+    if registry(home).is_empty() {
+        return Ok(None);
+    }
 
     // detected first, then the rest; project-scoped last
     let mut items: Vec<&'static Harness> = registry(home);
     items.sort_by_key(|h| (!h.detected(home), h.project_scoped));
 
-    let mut selected = vec![false; items.len()];
-    for (i, h) in items.iter().enumerate() {
-        selected[i] = h.detected(home) && installed_path(h, home, cwd).is_none();
-    }
+    // detection and install status are fixed while the picker is open —
+    // resolve them once instead of on every redraw (installed_path reads
+    // the filesystem)
+    let detected: Vec<bool> = items.iter().map(|h| h.detected(home)).collect();
+    let installed: Vec<bool> = items
+        .iter()
+        .map(|h| installed_path(h, home, cwd).is_some())
+        .collect();
+    let statuses: Vec<String> = detected
+        .iter()
+        .zip(&installed)
+        .map(|(&d, &i)| match (d, i) {
+            (true, true) => "● detected · already installed",
+            (true, false) => "● detected",
+            (false, true) => "· already installed",
+            (false, false) => "",
+        })
+        .map(String::from)
+        .collect();
+    let mut selected: Vec<bool> =
+        detected.iter().zip(&installed).map(|(&d, &i)| d && !i).collect();
     let mut cursor = 0usize;
+    let mut start = 0usize; // first visible row of the scrolling window
+    let mut redraw = true;
 
-    let _guard = crate::tui::RawGuard::enter()?;
-    let draw = |cursor: usize, selected: &[bool], items: &[&Harness]| -> std::io::Result<()> {
-        let mut out = stdout();
-        crossterm::execute!(
-            out,
-            crossterm::cursor::MoveTo(0, 0),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-        )?;
-        writeln!(
-            out,
-            "{}",
-            "Install the /tiered-memory skill for which harnesses?".bold()
-        )?;
-        writeln!(
-            out,
-            "{}",
-            "(space: toggle · a: all · enter: install · esc: cancel)\n".dim()
-        )?;
-        for (i, h) in items.iter().enumerate() {
-            let mark = if selected[i] { "[x]" } else { "[ ]" };
-            let live = if h.detected(home) { "● detected" } else { "" };
-            let done = if installed_path(h, home, cwd).is_some() {
-                "· already installed"
-            } else {
-                ""
-            };
-            let cursor_mark = if i == cursor { ">" } else { " " };
-            writeln!(
-                out,
-                "{cursor_mark} {mark} {:<38} {:<24} {} {}",
-                h.label,
-                h.target,
-                live.dim(),
-                done.dim()
-            )?;
-        }
-        writeln!(
-            out,
-            "\n{}",
-            "other directory: tiered-memory install-skill --dir <path>".dim()
-        )?;
-        out.flush()
+    // rows above the items (header, prompt, hint, more-above line) plus the
+    // two rows below them (more-below line, --dir hint)
+    const CHROME_ROWS: usize = 7;
+    let visible_rows = |item_count: usize| -> usize {
+        (height() as usize)
+            .saturating_sub(CHROME_ROWS)
+            .max(1)
+            .min(item_count)
     };
 
+    let frame = |cursor: usize, start: usize, selected: &[bool]| {
+        let cols = width() as usize;
+        // keep the status column visible on narrow terminals by squeezing the
+        // label column first; rows are trimmed again below either way
+        let status_w = statuses.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+        let label_w = items
+            .iter()
+            .map(|h| h.label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(cols.saturating_sub(6 + status_w + 1))
+            .max(8);
+
+        clear_screen();
+        header("install skill");
+        draw(
+            2,
+            "Install the /tiered-memory skill for which harnesses?",
+            None,
+            Some(Attribute::Bold),
+        );
+        draw(
+            3,
+            "(space: toggle · a: all · enter: install · esc: cancel)",
+            Some(Color::DarkGrey),
+            None,
+        );
+        if start > 0 {
+            draw(
+                4,
+                &format!("  … {start} more above"),
+                Some(Color::DarkGrey),
+                None,
+            );
+        }
+        for (row, i) in (start..start + visible_rows(items.len())).enumerate() {
+            let y = 5 + row as u16;
+            let h = items[i];
+            let cursor_mark = if i == cursor { ">" } else { " " };
+            let mark = if selected[i] { "[x]" } else { "[ ]" };
+            // trim to what the terminal actually fits — a wrapped row is what
+            // garbled this picker before. The path column is the least
+            // important, so it is dropped first when the row would overflow.
+            let base = format!("{cursor_mark} {mark} ");
+            let room = cols.saturating_sub(base.chars().count());
+            let label = if room == 0 {
+                String::new()
+            } else {
+                // truncate to the column first, then pad for alignment —
+                // `{:<…}` alone only pads
+                trunc(&format!("{:<label_w$}", trunc(h.label, label_w as u16)), room as u16)
+            };
+            let mut room = room.saturating_sub(label.chars().count());
+            let status = &statuses[i];
+            let target = if !h.target.is_empty()
+                && room >= h.target.chars().count() + status.chars().count() + 2
+            {
+                format!(" {}", h.target)
+            } else {
+                String::new()
+            };
+            room -= target.chars().count();
+            let status = if status.is_empty() || room < 2 {
+                String::new()
+            } else {
+                trunc(&format!(" {status}"), room as u16)
+            };
+            let _ = crossterm::execute!(
+                stdout(),
+                MoveTo(0, y),
+                Print(format!("{base}{label}")),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("{target}{status}")),
+                ResetColor,
+                Clear(UntilNewLine)
+            );
+        }
+        let window = visible_rows(items.len());
+        if start + window < items.len() {
+            draw(
+                5 + window as u16,
+                &format!("  … {} more below", items.len() - start - window),
+                Some(Color::DarkGrey),
+                None,
+            );
+        }
+        draw(
+            6 + window as u16,
+            "other directory: tiered-memory install-skill --dir <path>",
+            Some(Color::DarkGrey),
+            None,
+        );
+        stdout().flush().ok();
+    };
+
+    let _guard = crate::tui::RawGuard::enter()?;
     loop {
-        draw(cursor, &selected, &items)
-            .map_err(|e| MemoryError::invalid(format!("terminal: {e}")))?;
-        if !event::poll(std::time::Duration::from_millis(250))
-            .map_err(|e| MemoryError::invalid(format!("terminal: {e}")))?
-        {
-            continue;
-        }
-        let Event::Key(k) =
-            event::read().map_err(|e| MemoryError::invalid(format!("terminal: {e}")))?
-        else {
-            continue;
-        };
-        if k.kind != KeyEventKind::Press {
-            continue;
-        }
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-            KeyCode::Down => cursor = (cursor + 1).min(items.len() - 1),
-            KeyCode::Up => cursor = cursor.saturating_sub(1),
-            KeyCode::Char(' ') => selected[cursor] = !selected[cursor],
-            KeyCode::Char('a') => {
-                let all = selected.iter().all(|s| *s);
-                selected.iter_mut().for_each(|s| *s = !all);
+        if redraw {
+            redraw = false;
+            // keep the cursor inside the visible window
+            let visible = visible_rows(items.len());
+            if cursor < start {
+                start = cursor;
             }
-            KeyCode::Enter | KeyCode::Char('d') => {
-                let chosen: Vec<&Harness> = items
-                    .iter()
-                    .zip(&selected)
-                    .filter(|(_, s)| **s)
-                    .map(|(h, _)| *h)
-                    .collect();
-                if chosen.is_empty() {
-                    continue;
+            if cursor >= start + visible {
+                start = cursor + 1 - visible;
+            }
+            frame(cursor, start, &selected);
+        }
+
+        if !event_available()? {
+            continue;
+        }
+        match event::read().map_err(|e| MemoryError::invalid(format!("terminal: {e}")))? {
+            Event::Resize(_, _) => redraw = true,
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                    return Ok(None);
                 }
-                return Ok(Some(chosen));
+                redraw = true;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+                    KeyCode::Down => cursor = (cursor + 1).min(items.len() - 1),
+                    KeyCode::Up => cursor = cursor.saturating_sub(1),
+                    KeyCode::Char(' ') => selected[cursor] = !selected[cursor],
+                    KeyCode::Char('a') => {
+                        let all = selected.iter().all(|s| *s);
+                        selected.iter_mut().for_each(|s| *s = !all);
+                    }
+                    KeyCode::Enter | KeyCode::Char('d') => {
+                        let chosen: Vec<&Harness> = items
+                            .iter()
+                            .zip(&selected)
+                            .filter(|(_, s)| **s)
+                            .map(|(h, _)| *h)
+                            .collect();
+                        if chosen.is_empty() {
+                            continue;
+                        }
+                        return Ok(Some(chosen));
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }

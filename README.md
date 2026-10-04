@@ -12,6 +12,7 @@ recall("how do I explain recursion?")
 │ L1 · hot · THIS project          │  prefs for the project you're in
 ├──────────────────────────────────┤
 │ L2 · warm · related scopes       │  sibling components + similar projects
+│                                  │  + projects this one uses
 ├──────────────────────────────────┤
 │ L3 · cold · global traits        │  holds across every project
 └──────────────────────────────────┘
@@ -25,9 +26,10 @@ without depending on it.
 
 ## 1. Run it
 
-**Set up (recommended):** run inside any project directory and answer three
-short prompts — project registration, LLM provider (skipped if already
-configured), and which agent harness(es) get the skill:
+**Set up (recommended):** run inside any project directory and answer a few
+short prompts — project registration, its L2 group (the family of projects
+it shares memories with), LLM provider (skipped if already configured), and
+which agent harness(es) get the skill:
 
 ```bash
 cd my-project/
@@ -94,9 +96,13 @@ tiered-memory remember "All my CLI projects use clap" --group rust-clis  # → L
 tiered-memory recall "how should I introduce recursion?"
 tiered-memory params                                                   # adjusted parameters, per layer
 tiered-memory group                                                    # this project's L2 group
+tiered-memory group rename <old> <new>                                 # rename a group (onto an existing one = merge)
+tiered-memory use <other-project>                                      # draw on another project's L1+L2
+tiered-memory status                                                   # setup report (--check: exit 1 if not set up)
 tiered-memory projects                                                 # everything using tiered memory
 tiered-memory select                                                   # pick the current project
 tiered-memory stats                                                    # L1/L2/L3 counts vs capacity
+tiered-memory forget <id>   # or: forget --project P | --level L3 | --all
 tiered-memory console                                                  # terminal dashboard (see §6)
 ```
 
@@ -107,10 +113,25 @@ up as `alternatives` in `params`.
 
 **L2 groups.** Projects can be assigned to a named group (a family like
 `rust-clis` or `tutors`) — group members share L2 memories. Run
-`tiered-memory group` to see the assignment (+ a suggestion from similar
-projects); the `/tiered-memory` skill asks about it **once per project** and
-`group set <name|none>` records the user's answer, which is authoritative —
-automatic clustering only proposes.
+`tiered-memory group` to see the assignment (+ a suggestion and the existing
+groups when unset). The `/tiered-memory` skill asks about it **once per
+project**; the interactive picker lists existing groups to join by number —
+or founds a new one, optionally seeding it with other projects, so the name
+is just a label for a membership you can see. `group set <name|none>`
+records the answer (authoritative — automatic clustering only proposes) and
+guards against typos: a new name within edit distance of an existing group
+asks for confirmation. `group rename <old> <new>` fixes or merges groups
+after the fact, moving every project and group-owned memory.
+
+**Cross-project reuse.** Groups share warm memories symmetrically; sometimes
+you want one project to draw on *one specific* project — its hot L1 lines
+included. `tiered-memory use <other-project>` links this project to that one:
+its L1 **and** L2 memories surface here in the warm (L2) tier, and hot ones
+migrate into this project's L1 as they keep being recalled (write-allocate).
+The link is **directional** — the other project gains nothing — and
+`tiered-memory use` shows both directions (what this project uses, and who is
+drawing on it); `use --remove <other>` drops the link. All of this also
+works over HTTP (`POST /v1/projects/uses`).
 
 **L2 docs, not one big file.** L2's human-readable layer is filed per group
 and per topic: `cache/L2/groups/rust-clis/writing-style.md`,
@@ -215,10 +236,20 @@ each membership. `tab`/`←`/`→` switch panels, `r` refreshes, `q` quits.
 tiered-memory serve        # http://127.0.0.1:7900
 ```
 
+Every request and operation is logged to stdout (`remember`/`recall`/`feedback`
+outcomes with dedupe and promotion counts, deletions, consolidation results,
+errors — health probes skipped). `TM_QUIET=1` silences it.
+
+The service root is a **browser dashboard**: layer gauges, every project as a
+node, L2 groups on the right, a line per membership — open
+`http://127.0.0.1:7900/` while it runs (`?user=<name>` for non-default
+users). For the terminal version with more detail, see `tiered-memory console`.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/health` · `GET /v1/stats/{user}` | status, per-layer counts |
 | `POST /v1/projects` · `GET /v1/projects/{user}` | register/list projects |
+| `POST /v1/projects/group` · `POST /v1/projects/group/rename` · `POST /v1/projects/uses` | L2 group · rename/merge · cross-project memory sources |
 | `POST /v1/remember` · `POST /v1/recall` | store · layered semantic search |
 | `POST /v1/params` · `POST /v1/feedback` | adjusted parameters · assert one value |
 | `POST /v1/consolidate` · `POST /v1/forget` · `POST /v1/reindex` | maintenance |
@@ -255,6 +286,7 @@ human-readable mirrors regenerated on every write:
 ├── credentials.json                   ← LLM credentials (0600)
 ├── projects/<id>.json                 ← project descriptors
 ├── cache/
+│   ├── uses.txt                       ← hand-editable project → project memory sources
 │   ├── L1/<project>/memories.json|md  ← hot, project-only
 │   ├── L2/memories.json               ← related scopes (flat machine store)
 │   │   ├── groups/<g>/<topic>.md      ← per-group, per-topic docs
@@ -273,18 +305,20 @@ human-readable mirrors regenerated on every write:
 | `TM_DATA_DIR` | `~/tiered-memory` | data root |
 | `TM_BIND` | `127.0.0.1:7900` | HTTP bind address |
 | `TM_USER` | `local` | default user |
-| `TM_EMBEDDER` | `hashing` | `hashing` \| `local` \| `http` |
+| `TM_EMBEDDER` | `local` | `local` \| `hashing` \| `http` (no `local` feature → `hashing`) |
 | `TM_MODEL` | `minilm` | local preset (`minilm` \| `bge-small`) |
 | `TM_L1/L2/L3_CAPACITY` | `128/1024/4096` | layer sizes |
 | `TM_CONSOLIDATE_EVERY` | `50` | auto-consolidate every N writes |
 | `TM_BASE_URL` | `http://127.0.0.1:7900` | service URL the CLI talks to |
 | `TM_LLM_BASE_URL/API_KEY/MODEL` | – | LLM credentials via env |
 
-Embedder backends: `hashing` (offline, lexical, default), `local` (embedded
-candle sentence-transformer, CPU, no Python), `http` (any OpenAI-compatible
-`/embeddings` endpoint — **shares the same credentials as `sync`**, no separate
-config). Switching is safe — stores carry a fingerprint and refuse mixed
-geometries until `POST /v1/reindex`.
+Embedder backends: `local` (embedded candle sentence-transformer, CPU, no
+Python — the default, `minilm:384`, weights fetched once from the hub and
+cached), `hashing` (offline, lexical — the fallback in builds without the
+`local` feature), `http` (any OpenAI-compatible `/embeddings` endpoint —
+**shares the same credentials as `sync`**, no separate config). Switching is
+safe — stores carry a fingerprint and refuse mixed geometries until
+`POST /v1/reindex`.
 
 ## As a Rust crate (optional)
 
@@ -317,6 +351,24 @@ cargo test --features local -- --ignored  # + real-model smoke test
 ```
 
 MIT — see [LICENSE](LICENSE).
+
+## Benchmark it
+
+```bash
+tiered-memory bench                                  # defaults: 40 projects, 8 memories each
+tiered-memory bench --projects 200 --queries 500 --json > hash.json
+TM_EMBEDDER=local tiered-memory bench --json > local.json   # embedded model
+TM_DATA_DIR=/dev/shm/tm tiered-memory bench ...             # tmpfs vs disk
+```
+
+Generates a deterministic synthetic corpus (same numbers on every machine —
+no LLM, no network), runs register / remember / recall-hit / recall-miss /
+params / consolidate against a **scratch store that is deleted afterwards** —
+your real memory is never touched. `--keep` keeps the scratch store,
+`--store DIR` benchmarks an existing directory instead. Compare tables across
+`TM_EMBEDDER` backends, tmpfs vs disk, or machine generations; `--json` is
+for scripted diffs. Debug builds print a warning — benchmark release builds
+only.
 
 ## Uninstall
 

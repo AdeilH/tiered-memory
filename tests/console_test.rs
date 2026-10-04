@@ -24,6 +24,7 @@ fn seed(root: &std::path::Path) {
                 descriptor: format!("project {id}"),
                 descriptor_vector: vec![],
                 similar: vec![],
+                uses: vec![],
                 group: group.map(str::to_string),
                 created_at_ms: 1,
             },

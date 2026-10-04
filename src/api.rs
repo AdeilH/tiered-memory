@@ -7,9 +7,9 @@ use crate::engine::{
 };
 use crate::error::MemoryError;
 use crate::types::{ParamValue, ProjectInfo};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/v1/context/{user}/{project}", get(context))
         .route("/v1/projects", post(projects))
         .route("/v1/projects/group", post(set_group))
+        .route("/v1/projects/group/rename", post(rename_group))
+        .route("/v1/projects/uses", post(set_uses))
         .route("/v1/projects/{user}", get(list_projects))
         .route("/v1/projects/{user}/{project}", delete(remove_project))
         .route("/v1/remember", post(remember))
@@ -48,8 +50,88 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             require_token,
         ))
         .route("/v1/health", get(health))
+        .route("/", get(dashboard))
+        .layer(axum::middleware::from_fn(log_requests))
         .with_state(state)
 }
+
+/// One line per request — method, path, status, duration. Health probes and
+/// dashboard poll GETs are skipped (reads are opt-in via TM_VERBOSE=1);
+/// operations and errors always log. `TM_QUIET=1` silences everything.
+async fn log_requests(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let verbose = std::env::var("TM_VERBOSE").as_deref() == Ok("1");
+    let skip = path == "/v1/health" || (method == "GET" && !verbose);
+    if !skip && logging_enabled() {
+        println!(
+            "tm: {method} {path} → {} ({})",
+            response.status().as_u16(),
+            fmt_duration(start.elapsed())
+        );
+    }
+    response
+}
+
+fn logging_enabled() -> bool {
+    std::env::var("TM_QUIET").as_deref() != Ok("1")
+}
+
+fn fmt_duration(d: std::time::Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms >= 10.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{ms:.1}ms")
+    }
+}
+
+/// One line per meaningful operation (writes, deletions, maintenance).
+fn log_op(msg: String) {
+    if logging_enabled() {
+        println!("tm: {msg}");
+    }
+}
+
+/// Browser dashboard at the service root — a live, self-contained page
+/// (assets/dashboard.html): first paint from a server-injected snapshot,
+/// then polls /v1/stats + /v1/projects every 3s. Read-only;
+/// `?user=<name>` selects a non-default user.
+async fn dashboard(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Html<String> {
+    let user = params
+        .get("user")
+        .cloned()
+        .unwrap_or_else(|| crate::LOCAL_USER.to_string());
+    let stats = blocking(&state, {
+        let u = user.clone();
+        move |e| e.stats(&u)
+    })
+    .await;
+    let projects = blocking(&state, {
+        let u = user.clone();
+        move |e| e.list_projects(&u)
+    })
+    .await;
+    let payload = match (stats, projects) {
+        (Ok(s), Ok(p)) => serde_json::json!({ "user": user, "stats": s, "projects": p }),
+        (Err(e), _) | (_, Err(e)) => serde_json::json!({
+            "user": user, "stats": null, "projects": null, "error": e.message
+        }),
+    };
+    // embedded for the page's first paint; `</` is escaped so store content
+    // can never close the script tag — the client renders with textContent
+    let mut json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    json = json.replace("</", "<\\/");
+    Html(DASHBOARD.replace("__SNAPSHOT__", &json))
+}
+
+/// The dashboard page (HTML + CSS + JS, no external assets, works offline).
+const DASHBOARD: &str = include_str!("../assets/dashboard.html");
 
 async fn require_token(
     State(state): State<Arc<ServerState>>,
@@ -105,6 +187,7 @@ impl From<MemoryError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        log_op(format!("error {} {}", self.status.as_u16(), self.message));
         (self.status, Json(json!({ "error": self.message }))).into_response()
     }
 }
@@ -166,9 +249,14 @@ async fn projects(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ProjectInput>,
 ) -> ApiResult<ProjectInfo> {
-    Ok(Json(
-        blocking(&state, move |e| e.register_project(req)).await?,
-    ))
+    let user = req.user.clone();
+    let id = req.project_id.clone();
+    let info = blocking(&state, move |e| e.register_project(req)).await?;
+    log_op(format!(
+        "registered project `{id}` for `{user}` (similar: {})",
+        info.similar.join(", ")
+    ));
+    Ok(Json(info))
 }
 
 #[derive(Deserialize)]
@@ -191,12 +279,16 @@ async fn set_group(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<GroupBody>,
 ) -> ApiResult<ProjectInfo> {
-    Ok(Json(
-        blocking(&state, move |e| {
-            e.set_project_group(&req.user, &req.project_id, req.group.as_deref())
-        })
-        .await?,
-    ))
+    let (user, project, group) = (req.user.clone(), req.project_id.clone(), req.group.clone());
+    let info = blocking(&state, move |e| {
+        e.set_project_group(&req.user, &req.project_id, req.group.as_deref())
+    })
+    .await?;
+    log_op(format!(
+        "group of `{project}` ({user}) → {}",
+        group.as_deref().unwrap_or("(unassigned)")
+    ));
+    Ok(Json(info))
 }
 
 async fn list_projects(
@@ -208,28 +300,127 @@ async fn list_projects(
     ))
 }
 
+/// Rename an L2 group everywhere (projects + group-owned memories); renaming
+/// onto an existing group merges the two. → `{"projects": n, "records": m}`.
+#[derive(Deserialize)]
+struct GroupRenameBody {
+    user: String,
+    from: String,
+    to: String,
+}
+
+async fn rename_group(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<GroupRenameBody>,
+) -> ApiResult<serde_json::Value> {
+    let (user, from, to) = (req.user.clone(), req.from.clone(), req.to.clone());
+    let (f2, t2) = (from.clone(), to.clone());
+    let (projects, records) = blocking(&state, move |e| e.rename_group(&user, &from, &to)).await?;
+    log_op(format!(
+        "group `{f2}` → `{t2}` for `{}`: {projects} project(s), {records} group-owned memory/memories moved",
+        req.user
+    ));
+    Ok(Json(json!({ "projects": projects, "records": records })))
+}
+
+/// Add or remove a cross-project memory source for one project. Exactly one
+/// of `add` / `remove`, naming the *other* project: `{"add": "a"}` makes the
+/// project see a's L1+L2 memories (from its warm L2 tier — directional, a
+/// gains nothing); `{"remove": "a"}` drops the link again.
+#[derive(Deserialize)]
+struct UsesBody {
+    user: String,
+    project_id: String,
+    #[serde(default)]
+    add: Option<String>,
+    #[serde(default)]
+    remove: Option<String>,
+}
+
+async fn set_uses(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<UsesBody>,
+) -> ApiResult<ProjectInfo> {
+    let (adding, target) = match (req.add.as_deref(), req.remove.as_deref()) {
+        (Some(t), None) => (true, t),
+        (None, Some(t)) => (false, t),
+        _ => {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "needs exactly one of `add` or `remove`".into(),
+            })
+        }
+    };
+    let (user, project, target) = (
+        req.user.clone(),
+        req.project_id.clone(),
+        target.to_string(),
+    );
+    let (u2, p2, t2) = (user.clone(), project.clone(), target.clone());
+    let info = blocking(&state, move |e| {
+        if adding {
+            e.add_project_use(&user, &project, &target)
+        } else {
+            e.remove_project_use(&user, &project, &target)
+        }
+    })
+    .await?;
+    log_op(format!(
+        "uses of `{p2}` ({u2}): {} `{t2}` → {:?}",
+        if adding { "+" } else { "-" },
+        info.uses
+    ));
+    Ok(Json(info))
+}
+
 /// Unregister a project and forget all of its records (every level).
 async fn remove_project(
     State(state): State<Arc<ServerState>>,
     Path((user, project)): Path<(String, String)>,
 ) -> ApiResult<usize> {
-    Ok(Json(
-        blocking(&state, move |e| e.remove_project(&user, &project)).await?,
-    ))
+    let (u2, p2) = (user.clone(), project.clone());
+    let removed = blocking(&state, move |e| e.remove_project(&u2, &p2)).await?;
+    log_op(format!(
+        "removed project `{project}` ({user}) — {removed} memories forgotten"
+    ));
+    Ok(Json(removed))
 }
 
 async fn remember(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<RememberInput>,
 ) -> ApiResult<RememberOutcome> {
-    Ok(Json(blocking(&state, move |e| e.remember(req)).await?))
+    let (user, project, level) = (req.user.clone(), req.project_id.clone(), req.level);
+    let out = blocking(&state, move |e| e.remember(req)).await?;
+    log_op(format!(
+        "remember `{}` user={user} project={} level={} deduped={} demoted_to_l2={}",
+        out.id,
+        project.as_deref().unwrap_or("-"),
+        level
+            .map(|l| format!("{l:?}"))
+            .unwrap_or_else(|| "auto".into()),
+        out.deduped,
+        out.demoted_to_l2
+    ));
+    if out.auto_consolidated {
+        log_op("auto-consolidation ran (every N writes)".into());
+    }
+    Ok(Json(out))
 }
 
 async fn recall(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<RecallInput>,
 ) -> ApiResult<RecallOutput> {
-    Ok(Json(blocking(&state, move |e| e.recall(req)).await?))
+    let (user, project, query) = (req.user.clone(), req.project_id.clone(), req.query.clone());
+    let out = blocking(&state, move |e| e.recall(req)).await?;
+    log_op(format!(
+        "recall \"{query}\" user={user} project={} → {} hit(s), {} promoted",
+        project.as_deref().unwrap_or("-"),
+        out.hits.len(),
+        out.promoted.len()
+    ));
+    Ok(Json(out))
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,7 +488,18 @@ async fn feedback(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<FeedbackInput>,
 ) -> ApiResult<RememberOutcome> {
-    Ok(Json(blocking(&state, move |e| e.feedback(req)).await?))
+    let (user, key, global) = (
+        req.user.clone(),
+        req.key.clone(),
+        req.global.unwrap_or(false),
+    );
+    let out = blocking(&state, move |e| e.feedback(req)).await?;
+    log_op(format!(
+        "feedback {key} user={user} scope={} deduped={}",
+        if global { "global" } else { "project" },
+        out.deduped
+    ));
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -309,16 +511,40 @@ async fn consolidate(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ConsolidateBody>,
 ) -> ApiResult<ConsolidationReport> {
-    Ok(Json(
-        blocking(&state, move |e| e.consolidate(&req.user)).await?,
-    ))
+    let user = req.user.clone();
+    let report = blocking(&state, move |e| e.consolidate(&req.user)).await?;
+    log_op(format!(
+        "consolidate user={user}: {} expired, {} forgotten, {} merged, {} traits lifted",
+        report.expired, report.forgotten, report.merged, report.traits_lifted
+    ));
+    Ok(Json(report))
 }
 
 async fn forget(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ForgetInput>,
 ) -> ApiResult<usize> {
-    Ok(Json(blocking(&state, move |e| e.forget(req)).await?))
+    let (user, id, project, level, all) = (
+        req.user.clone(),
+        req.id.clone(),
+        req.project_id.clone(),
+        req.level,
+        req.all,
+    );
+    let removed = blocking(&state, move |e| e.forget(req)).await?;
+    let scope = if all == Some(true) {
+        "everything".to_string()
+    } else if let Some(id) = &id {
+        format!("id {id}")
+    } else if let Some(p) = &project {
+        format!("project {p}")
+    } else if let Some(l) = level {
+        format!("level {l:?}")
+    } else {
+        "?".to_string()
+    };
+    log_op(format!("forgot {removed} memories ({scope}) user={user}"));
+    Ok(Json(removed))
 }
 
 #[derive(Deserialize)]
@@ -330,5 +556,8 @@ async fn reindex(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ReindexBody>,
 ) -> ApiResult<usize> {
-    Ok(Json(blocking(&state, move |e| e.reindex(&req.user)).await?))
+    let user = req.user.clone();
+    let n = blocking(&state, move |e| e.reindex(&req.user)).await?;
+    log_op(format!("reindexed {n} memories user={user}"));
+    Ok(Json(n))
 }

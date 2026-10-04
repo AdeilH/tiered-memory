@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tiered-memory</title>
+<style>
+  :root { --bg:#0d0f14; --panel:#161a22; --line:#2b303c; --txt:#dde1e8; --mut:#7f8794;
+          --l1:#4fc1ff; --l2:#c792ea; --l3:#a5e075; --err:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, "Cascadia Mono", monospace; color: var(--txt);
+         background: radial-gradient(1100px 700px at 15% -10%, #1b2130, var(--bg));
+         min-height: 100vh; margin: 0; padding: 1.4em 1.6em 3em; max-width: 820px; margin-inline: auto; }
+  header { display: flex; align-items: center; gap: .8em; flex-wrap: wrap; }
+  h1 { font-size: 1.1em; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .tag { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 1px 8px; }
+  .muted { color: var(--mut); font-size: .85em; }
+  #live { width: 9px; height: 9px; border-radius: 50%; background: var(--l3); animation: breathe 2.4s ease-in-out infinite; }
+  #live.err { background: var(--err); }
+  @keyframes breathe { 0%,100% { box-shadow: 0 0 2px var(--l3); } 50% { box-shadow: 0 0 10px var(--l3); } }
+  #search { background: var(--panel); border: 1px solid var(--line); color: var(--txt);
+            border-radius: 4px; padding: 4px 10px; font: inherit; font-size: .85em; margin-left: auto; width: 180px; }
+  #search:focus { outline: 1px solid var(--l1); }
+  .row { display: flex; align-items: center; gap: 1em; margin: 7px 0; }
+  .lbl { width: 230px; color: var(--mut); }
+  .num { color: var(--mut); min-width: 90px; text-align: right; }
+  .bar { flex: 1; height: 12px; background: #20242e; border-radius: 3px; overflow: hidden; }
+  .fill { height: 100%; border-radius: 3px; transition: width .7s cubic-bezier(.2,.8,.2,1); }
+  h2 { font-size: .95em; color: var(--mut); margin: 1.8em 0 .6em; font-weight: 500; }
+  #flow { color: var(--mut); font-size: .85em; letter-spacing: .05em; }
+  #flow b { color: var(--txt); font-weight: 500; animation: drift 3s ease-in-out infinite; display: inline-block; }
+  @keyframes drift { 0%,100% { transform: translateX(0); opacity:.7 } 50% { transform: translateX(6px); opacity:1 } }
+  svg.graph { width: 100%; background: rgba(255,255,255,.015); border: 1px solid var(--line); border-radius: 8px; }
+  svg.graph .edge { stroke: #39404e; stroke-width: 1.5; transition: stroke .25s, opacity .25s; }
+  svg.graph.focus .edge { opacity: .12; }
+  svg.graph.focus .edge.lit { stroke: var(--l2); opacity: 1; }
+  svg.graph .node { cursor: pointer; transition: opacity .25s; }
+  svg.graph.focus .node.dim { opacity: .18; }
+  svg.graph .glow { filter: drop-shadow(0 0 6px rgba(199,146,234,.8)); animation: breathe 2.4s ease-in-out infinite; }
+  svg.graph.pulse .node { animation: pop .8s ease; }
+  @keyframes pop { 30% { transform: scale(1.06); } }
+  .hidden { display: none !important; }
+  #detail { position: relative; background: var(--panel); border: 1px solid var(--line);
+            border-radius: 8px; padding: 1em 1.2em; margin-top: 1.2em; }
+  #detail h3 { margin: 0 0 .4em; font-size: .95em; }
+  #detail h4 { margin: .9em 0 .2em; font-size: .8em; color: var(--mut); font-weight: 500; }
+  #detail .mem { display: flex; gap: .7em; padding: 3px 0; font-size: .88em; align-items: baseline; }
+  #detail .layer { color: var(--l1); font-size: .75em; min-width: 24px; }
+  #detail .layer.l2 { color: var(--l2); } #detail .layer.l3 { color: var(--l3); }
+  #detail code { background: #20242e; padding: 0 6px; border-radius: 3px; font-size: .8em; }
+  #detail .close { position: absolute; top: .6em; right: .6em; background: none; border: 1px solid var(--line);
+                   color: var(--mut); border-radius: 4px; cursor: pointer; font: inherit; }
+  #detail .close:hover { color: var(--txt); border-color: var(--mut); }
+  footer { margin-top: 2.5em; }
+  code { background: var(--panel); padding: 1px 6px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <div id="live" class="dot" title="live"></div>
+  <h1>tiered-memory <span id="user" class="tag"></span></h1>
+  <span id="total" class="muted"></span>
+  <input id="search" placeholder="filter  ( / )">
+</header>
+
+<section id="gauges" style="margin-top:1.2em"></section>
+<p id="flow"><b>L1</b> ──evict──▶ <b>L2</b> ──lift──▶ <b>L3</b> &nbsp; <span id="updated"></span></p>
+
+<h2>projects ↔ L2 groups <span class="muted">(hover to focus · click a project to inspect · / to filter)</span></h2>
+<div id="graph"></div>
+<div id="detail" class="hidden"></div>
+
+<footer class="muted">
+  live · polls every 3s · full graph in the terminal: <code>tiered-memory console</code>
+</footer>
+
+<noscript><p style="color:#ff6b6b">this dashboard needs JavaScript — the data endpoints (/v1/stats, /v1/projects) work without it.</p></noscript>
+
+<script>
+window.__INITIAL__ = __SNAPSHOT__;
+</script>
+<script>
+(() => {
+  "use strict";
+  const NS = "http://www.w3.org/2000/svg";
+  const $ = id => document.getElementById(id);
+  const user = new URLSearchParams(location.search).get("user") || "local";
+  $("user").textContent = user;
+
+  const el = (tag, cls, text) => {
+    const d = document.createElement(tag);
+    if (cls) d.className = cls;
+    if (text != null) d.textContent = text;
+    return d;
+  };
+  const svgEl = (tag, attrs) => {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  };
+  const mktext = (x, y, text, fill) => {
+    const t = svgEl("text", { x, y, fill, "font-size": 13 });
+    t.textContent = text;
+    return t;
+  };
+  const mkdot = (cx, cy, fill, tip) => {
+    const g = svgEl("g");
+    const t = svgEl("title");
+    t.textContent = tip || "";
+    g.appendChild(t);
+    g.appendChild(svgEl("circle", { cx, cy, r: 6, fill }));
+    return g;
+  };
+
+  let state = null, sig = null, gaugeEls = null, graph = null;
+
+  const setLive = ok => { $("live").classList.toggle("err", !ok); };
+
+  async function poll() {
+    try {
+      const [stats, projects] = await Promise.all([
+        fetch("/v1/stats/" + user).then(r => { if (!r.ok) throw r.status; return r.json(); }),
+        fetch("/v1/projects/" + user).then(r => { if (!r.ok) throw r.status; return r.json(); }),
+      ]);
+      const s = JSON.stringify([stats, projects]);
+      const changed = s !== sig;
+      sig = s;
+      state = { stats, projects };
+      render(changed);
+      setLive(true);
+      $("updated").textContent = "· updated " + new Date().toLocaleTimeString();
+    } catch (e) {
+      setLive(false);
+    }
+  }
+
+  function render(changed) {
+    const { stats, projects } = state;
+    $("total").textContent =
+      (stats.counts.l1 + stats.counts.l2 + stats.counts.l3) + " records · " +
+      projects.length + " project(s)";
+    renderGauges(stats);
+    renderGraph(projects, changed);
+  }
+
+  function renderGauges(stats) {
+    const defs = [
+      ["L1 · hot · this project", stats.counts.l1, stats.capacities.l1, "var(--l1)"],
+      ["L2 · warm · groups",      stats.counts.l2, stats.capacities.l2, "var(--l2)"],
+      ["L3 · cold · global",      stats.counts.l3, stats.capacities.l3, "var(--l3)"],
+    ];
+    if (!gaugeEls) {
+      gaugeEls = [];
+      const host = $("gauges");
+      for (const [label] of defs) {
+        const row = el("div", "row");
+        row.appendChild(el("span", "lbl", label));
+        const bar = el("div", "bar");
+        const fill = el("div", "fill");
+        bar.appendChild(fill);
+        row.appendChild(bar);
+        const num = el("span", "num");
+        row.appendChild(num);
+        host.appendChild(row);
+        gaugeEls.push({ fill, num });
+      }
+    }
+    defs.forEach(([_, count, cap, color], i) => {
+      gaugeEls[i].fill.style.width = (cap ? (count / cap) * 100 : 0) + "%";
+      gaugeEls[i].fill.style.background = color;
+      gaugeEls[i].num.textContent = count + " / " + cap;
+    });
+  }
+
+  function renderGraph(projects, changed) {
+    const groups = new Map();
+    const eff = g => (g && g !== "none" ? g : null);
+    for (const p of projects) {
+      const g = eff(p.group);
+      if (g) { if (!groups.has(g)) groups.set(g, []); groups.get(g).push(p); }
+    }
+    const gnames = [...groups.keys()];
+    const rows = Math.max(projects.length, groups.size, 1);
+    const H = rows * 46 + 60;
+    const py = i => 40 + i * 46, gy = i => 40 + i * 46;
+
+    const svg = svgEl("svg", { viewBox: `0 0 720 ${H}`, width: "100%", height: H, class: "graph" });
+    svg.appendChild(mktext(30, 18, "projects", "var(--l1)"));
+    svg.appendChild(mktext(520, 18, "L2 groups", "var(--l2)"));
+
+    const byProject = new Map(), byGroup = new Map();
+    projects.forEach((p, i) => {
+      const y = py(i);
+      const g = eff(p.group);
+      const node = svgEl("g", { class: "node" });
+      node.dataset.key = p.project_id;
+      node.dataset.search = (p.project_id + " " + (p.name || "") + " " + (p.descriptor || "") + " " + (g || "")).toLowerCase();
+      let lineEl = null;
+      if (g) {
+        const gi = gnames.indexOf(g), yy = gy(gi);
+        lineEl = svgEl("line", { x1: 150, y1: y, x2: 490, y2: yy, class: "edge" });
+        lineEl.dataset.group = g;
+        lineEl.dataset.project = p.project_id;
+        svg.appendChild(lineEl);
+        const dot = svgEl("circle", { r: 2.4, fill: "var(--l1)", opacity: .7, class: "flow" });
+        const flow = svgEl("animateMotion", {
+          dur: (2.4 + (i % 5) * 0.5) + "s", repeatCount: "indefinite",
+          path: `M 140 ${y} L 490 ${yy}`,
+        });
+        dot.appendChild(flow);
+        svg.appendChild(dot);
+        node.appendChild(mkdot(140, y, "var(--l1)", `${p.name || p.project_id} — ${p.descriptor || ""}`));
+      } else {
+        node.appendChild(mkdot(140, y, "#3c4250", `${p.name || p.project_id} — ${p.descriptor || ""}`));
+      }
+      node.appendChild(mktext(20, y + 4, p.project_id + (g ? "" : "  (no group)"), g ? "#dde1e8" : "#7f8794"));
+      node.addEventListener("click", () => openProject(p.project_id));
+      node.addEventListener("mouseenter", () => focus(p.project_id, null));
+      node.addEventListener("mouseleave", () => focus(null, null));
+      svg.appendChild(node);
+      byProject.set(p.project_id, { node, lineEl, group: g });
+    });
+    gnames.forEach((g, i) => {
+      const y = gy(i);
+      const node = svgEl("g", { class: "node" });
+      node.dataset.key = g;
+      node.dataset.search = g.toLowerCase();
+      node.appendChild(svgEl("circle", { cx: 500, cy: y, r: 8, fill: "var(--l2)", class: "glow" }));
+      node.appendChild(mktext(516, y + 4, `${g} · ${groups.get(g).length} member(s)`, "#dde1e8"));
+      node.addEventListener("mouseenter", () => focus(null, g));
+      node.addEventListener("mouseleave", () => focus(null, null));
+      svg.appendChild(node);
+      byGroup.set(g, node);
+    });
+
+    graph = { svg, byProject, byGroup };
+    const host = $("graph");
+    host.replaceChildren(svg);
+    applyFilter();
+    if (changed && sig !== null) {
+      svg.classList.add("pulse");
+      setTimeout(() => svg.classList.remove("pulse"), 900);
+    }
+  }
+
+  function focus(project, group) {
+    if (!graph) return;
+    const { svg, byProject, byGroup } = graph;
+    const active = project || group;
+    svg.classList.toggle("focus", !!active);
+    for (const [pid, rec] of byProject) {
+      const on = !active || pid === project || (group && rec.group === group);
+      rec.node.classList.toggle("dim", !!active && !on);
+      if (rec.lineEl) rec.lineEl.classList.toggle("lit", !!active && !!on && !!rec.group);
+    }
+    for (const [g, node] of byGroup) {
+      const on = !active || g === group || (project && byProject.get(project)?.group === g);
+      node.classList.toggle("dim", !!active && !on);
+    }
+  }
+
+  async function openProject(pid) {
+    const d = $("detail");
+    d.classList.remove("hidden");
+    d.replaceChildren(el("p", "muted", "loading " + pid + "…"));
+    try {
+      const resp = await fetch(`/v1/context/${user}/${pid}`);
+      if (!resp.ok) {
+        const hint = resp.status === 404
+          ? " — this service binary predates the context endpoint; restart `tiered-memory serve`"
+          : "";
+        throw new Error("HTTP " + resp.status + hint);
+      }
+      const ctx = await resp.json();
+      d.replaceChildren(el("h3", null, "memories visible to " + pid));
+      const mk = (title, lines, layer) => {
+        if (!lines.length) return;
+        d.appendChild(el("h4", null, title));
+        for (const m of lines) {
+          const row = el("div", "mem");
+          // the layer comes from the section (the context arrays ARE the
+          // layers) — memory lines themselves carry no level field
+          row.appendChild(el("span", "layer l" + layer.slice(1), layer));
+          row.appendChild(el("span", null, m.text));
+          if (m.key_hint) row.appendChild(el("code", null, m.key_hint));
+          d.appendChild(row);
+        }
+      };
+      mk("L1 · this project", ctx.l1, "L1");
+      mk("L2 · groups & related scopes", ctx.l2, "L2");
+      mk("L3 · global traits", ctx.l3, "L3");
+      if (!ctx.l1.length && !ctx.l2.length && !ctx.l3.length)
+        d.appendChild(el("p", "muted", "nothing remembered yet"));
+      const close = el("button", "close", "✕");
+      close.title = "close";
+      close.addEventListener("click", () => d.classList.add("hidden"));
+      d.appendChild(close);
+    } catch (e) {
+      d.replaceChildren(el("p", "muted", "failed to load context — " + (e && e.message ? e.message : e)));
+    }
+  }
+
+  function applyFilter() {
+    if (!graph) return;
+    const q = $("search").value.trim().toLowerCase();
+    const { svg, byProject, byGroup } = graph;
+    for (const [pid, rec] of byProject) {
+      const hit = !q || rec.node.dataset.search.includes(q);
+      rec.node.classList.toggle("hidden", !hit);
+      if (rec.lineEl) rec.lineEl.classList.toggle("hidden", !hit);
+    }
+    for (const [g, node] of byGroup) {
+      const hit = !q || node.dataset.search.includes(q) ||
+        [...byProject.entries()].some(([pid, rec]) => rec.group === g && byProject.get(pid).node.dataset.search.includes(q));
+      node.classList.toggle("hidden", !hit);
+    }
+  }
+  $("search").addEventListener("input", applyFilter);
+  document.addEventListener("keydown", e => {
+    if (e.key === "/" && document.activeElement !== $("search")) {
+      e.preventDefault();
+      $("search").focus();
+    }
+    if (e.key === "Escape") $("detail").classList.add("hidden");
+  });
+
+  // first paint from the server-injected snapshot, then live
+  const boot = window.__INITIAL__ || {};
+  if (boot.error) {
+    $("updated").textContent = "· store error: " + boot.error;
+  }
+  if (boot.stats && boot.projects) {
+    state = { stats: boot.stats, projects: boot.projects };
+    sig = JSON.stringify([boot.stats, boot.projects]);
+    render(false);
+    setLive(true);
+  }
+  setInterval(poll, 3000);
+  poll();
+})();
+</script>
+</body>
+</html>

@@ -378,6 +378,237 @@ fn l2_groups_share_memories_across_members_only() {
 }
 
 #[test]
+fn used_projects_share_l1_and_l2_memories() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    register(&e, "projA", "react frontend project");
+    register(&e, "projB", "rust systems project");
+
+    // projA holds an L1 hot line, an L2 line, and an L1 parameter
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "prefers analogies from games".into(),
+        project_id: Some("projA".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "uses zustand for state management".into(),
+        project_id: Some("projA".into()),
+        level: Some(Level::L2),
+        ..Default::default()
+    })
+    .unwrap();
+    feedback(&e, "difficulty", ParamValue::Number(0.2), Some("projA"));
+    // and projB has a memory of its own so directionality is checkable
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "likes ripgrep over grep".into(),
+        project_id: Some("projB".into()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // before the link: nothing of projA's surfaces in projB
+    let before = recall(&e, "analogies from games", Some("projB"));
+    assert!(
+        !before.hits.iter().any(|h| h.text.contains("analogies")),
+        "no borrowing without a `uses` link"
+    );
+    assert!(e
+        .adjusted_parameters(U, Some("projB"))
+        .unwrap()
+        .iter()
+        .all(|s| s.key != "difficulty"));
+
+    e.add_project_use(U, "projB", "projA").unwrap();
+
+    // after: projA's L1 and L2 surface in projB — the L1 line serving warm
+    let out = recall(&e, "analogies from games", Some("projB"));
+    let hot = out
+        .hits
+        .iter()
+        .find(|h| h.text.contains("analogies"))
+        .expect("used project's L1 memory must surface");
+    assert_eq!(hot.level, Level::L2, "borrowed hot lines serve warm");
+    assert_eq!(hot.project_id.as_deref(), Some("projA"));
+    assert!(
+        out.hits
+            .iter()
+            .any(|h| h.text.contains("zustand") && h.level == Level::L2),
+        "used project's L2 memory must surface too"
+    );
+
+    // params: the borrowed L1 assertion ranks as L2 for projB
+    let params = e.adjusted_parameters(U, Some("projB")).unwrap();
+    let diff = params.iter().find(|s| s.key == "difficulty").unwrap();
+    assert_eq!(diff.value, ParamValue::Number(0.2));
+    assert_eq!(diff.source, Level::L2, "borrowed params come from warm tier");
+
+    // …but projB's own L1 still beats the borrowed one (nearest layer wins)
+    feedback(&e, "difficulty", ParamValue::Number(0.8), Some("projB"));
+    let params = e.adjusted_parameters(U, Some("projB")).unwrap();
+    let diff = params.iter().find(|s| s.key == "difficulty").unwrap();
+    assert_eq!(diff.value, ParamValue::Number(0.8));
+    assert_eq!(diff.source, Level::L1);
+    assert!(diff
+        .alternatives
+        .iter()
+        .any(|a| a.value == ParamValue::Number(0.2) && a.source == Level::L2));
+
+    // directionality: projA does not see projB's memories
+    let back = recall(&e, "ripgrep over grep", Some("projA"));
+    assert!(
+        !back.hits.iter().any(|h| h.text.contains("ripgrep")),
+        "`uses` is directional — the used project gains nothing"
+    );
+
+    // memory_context buckets the borrowed line under L2 (the sync gather
+    // treats it as warm context of projB, not as its hot line)
+    let ctx = e.memory_context(U, Some("projB"), 40).unwrap();
+    assert!(ctx.l1.iter().all(|l| !l.text.contains("analogies")));
+    assert!(ctx.l2.iter().any(|l| l.text.contains("analogies")));
+
+    // removing the link stops the sharing again
+    e.remove_project_use(U, "projB", "projA").unwrap();
+    let after = recall(&e, "analogies from games", Some("projB"));
+    assert!(
+        !after.hits.iter().any(|h| h.text.contains("analogies")),
+        "borrowed lines must stop surfacing after unlinking"
+    );
+
+    // validation: no self-links, unknown projects 404
+    let res = e.add_project_use(U, "projB", "projB");
+    assert!(matches!(res, Err(MemoryError::Invalid(_))));
+    let res = e.add_project_use(U, "projB", "ghost");
+    assert!(matches!(res, Err(MemoryError::ProjectNotFound(_))));
+}
+
+#[test]
+fn hot_borrowed_lines_promote_into_the_borrowers_l1() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine_at(dir.path(), &Clock::new(), |c| c.promote_min_hits = 2);
+    register(&e, "projA", "react frontend project");
+    register(&e, "projB", "rust systems project");
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "prefers analogies from games".into(),
+        project_id: Some("projA".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    e.add_project_use(U, "projB", "projA").unwrap();
+
+    // first recall touches; the second crosses the promotion threshold
+    let first = recall(&e, "prefers analogies from games", Some("projB"));
+    assert!(first.promoted.is_empty());
+    let second = recall(&e, "prefers analogies from games", Some("projB"));
+    assert_eq!(second.promoted.len(), 1, "borrowed hit promotes into L1");
+
+    // the third recall serves the copy: a real L1 line of projB now
+    let third = recall(&e, "prefers analogies from games", Some("projB"));
+    let copy = third
+        .hits
+        .iter()
+        .find(|h| h.level == Level::L1 && h.text.contains("analogies"))
+        .expect("promoted copy serves from the borrower's hot line");
+    assert_eq!(copy.project_id.as_deref(), Some("projB"));
+}
+
+#[test]
+fn group_rename_moves_projects_and_group_owned_memories() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    register(&e, "projA", "react frontend project");
+    register(&e, "projB", "rust systems project");
+    register(&e, "projC", "go services project");
+    e.set_project_group(U, "projA", Some("typo-group")).unwrap();
+    e.set_project_group(U, "projB", Some("typo-group")).unwrap();
+    e.set_project_group(U, "projC", Some("other")).unwrap();
+
+    // a group-owned memory carrying the typo'd name
+    e.remember(RememberInput {
+        user: U.into(),
+        text: "all cli projects in this family use clap".into(),
+        level: Some(Level::L2),
+        group: Some("typo-group".into()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let (projects, records) = e.rename_group(U, "typo-group", "rust-clis").unwrap();
+    assert_eq!((projects, records), (2, 1));
+
+    let by_id = |id: &str| {
+        e.list_projects(U)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.project_id == id)
+            .unwrap()
+    };
+    assert_eq!(by_id("projA").group.as_deref(), Some("rust-clis"));
+    assert_eq!(by_id("projB").group.as_deref(), Some("rust-clis"));
+    assert_eq!(by_id("projC").group.as_deref(), Some("other"));
+
+    // group-owned memories follow the rename
+    let hits = recall(&e, "all cli projects family use clap", Some("projB")).hits;
+    assert!(
+        hits.iter().any(|h| h.text.contains("family")),
+        "group-owned memory must stay visible after rename"
+    );
+
+    // renaming onto an existing group merges the two
+    e.set_project_group(U, "projC", Some("other")).unwrap();
+    let (projects, records) = e.rename_group(U, "rust-clis", "other").unwrap();
+    assert_eq!((projects, records), (2, 1));
+    assert_eq!(by_id("projA").group.as_deref(), Some("other"));
+
+    // validation: same name, unknown source group, invalid target name
+    assert!(matches!(
+        e.rename_group(U, "other", "other"),
+        Err(MemoryError::Invalid(_))
+    ));
+    assert!(matches!(
+        e.rename_group(U, "ghost", "whatever"),
+        Err(MemoryError::Invalid(_))
+    ));
+    assert!(matches!(
+        e.rename_group(U, "other", "none"),
+        Err(MemoryError::Invalid(_))
+    ));
+}
+
+#[test]
+fn uses_links_survive_re_registration_and_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    register(&e, "projA", "react frontend project");
+    register(&e, "projB", "rust systems project");
+    e.add_project_use(U, "projB", "projA").unwrap();
+
+    // re-registering projB (like a re-init) keeps the user-set link
+    register(&e, "projB", "rust systems project, embedded");
+    let info = e
+        .list_projects(U)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.project_id == "projB")
+        .unwrap();
+    assert_eq!(info.uses, vec!["projA".to_string()]);
+
+    // removing projA strips the link from its users
+    e.remove_project(U, "projA").unwrap();
+    let info = e
+        .list_projects(U)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.project_id == "projB")
+        .unwrap();
+    assert!(info.uses.is_empty(), "links to removed projects are dropped");
+}
+
+#[test]
 fn topics_are_normalized_and_filed_into_per_topic_docs() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Clock::new();

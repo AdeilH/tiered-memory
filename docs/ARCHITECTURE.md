@@ -48,7 +48,7 @@ for de-duplicating alternatives): numbers agree within a tolerance (default
 
 Everything for one learner: embedder fingerprint + dims, the records, and the
 project registry (`ProjectInfo`: descriptor text + vector, tags, components,
-`similar: Vec<project_id>`).
+`similar: Vec<project_id>`, `uses: Vec<project_id>`).
 
 ## 2. The Embedder boundary
 
@@ -102,14 +102,21 @@ kind `feedback`, confidence `weight`.
 ## 4. Read path (`recall`)
 
 1. Embed the query; resolve visibility:
-   - `L1` — records of exactly this project.
+   - `L1` — records of exactly this project **plus**, when the project
+     explicitly `uses` another one, that project's L1 records too. Borrowed
+     hot lines do not serve as the viewer's hot line: a record's
+     *serving level* is L2 whenever an L1 record serves for a project other
+     than its owner (`MemoryRecord::serving_level_for`), so "L1 in the
+     output = this project's hot line" stays true everywhere — ranking,
+     parameter precedence, and the sync gather's L1/L2 buckets alike.
    - `L2` — records of this project **plus** records of related scopes:
      `similar` projects (linked at registration by descriptor similarity),
      the project's **L2 group** (a user-confirmed family of projects, e.g.
      `rust-clis`; membership lives in `ProjectInfo.group` + the hand-editable
-     `groups.txt`), and group-owned records (`group` set on the record itself,
-     no single owning project — "all my CLIs use clap"). Same-project
-     components share the project id, so they federate automatically.
+     `groups.txt`), the projects this one explicitly `uses`, and group-owned
+     records (`group` set on the record itself, no single owning project —
+     "all my CLIs use clap"). Same-project components share the project id,
+     so they federate automatically.
    - `L3` — everything global.
 2. Score every visible, unexpired record:
    `score = cosine × level_weight × (0.5 + 0.5·confidence) × (1 + 0.15·2^(−age_days/14))`
@@ -167,7 +174,7 @@ value = confidence × 2^(−age_days/30) × (1 + ln(1+use_count)) × (key_hint ?
    This is how "always wants slow pace" stops being re-taught per project.
 5. **Capacity** across all layers.
 
-## 7. Similar projects (L2 federation)
+## 7. Similar projects, groups, and `uses` (L2 federation)
 
 `register_project` embeds `descriptor` (explicit text or `name + tags +
 components`) and recomputes pairwise similarity over all of the user's
@@ -176,6 +183,20 @@ symmetrically in `ProjectInfo.similar`. Recall for project P expands L2
 visibility to `similar(P)`. Re-registration (a project "changes topic")
 recomputes links. Components ("frontend"/"backend") are metadata *and*
 descriptor terms; since they live under one project id, they always share L2.
+
+Two user-controlled mechanisms sit on top:
+
+- **L2 groups** (`ProjectInfo.group` + `groups.txt`) — a symmetric family:
+  every member sees every other member's project-owned L2 records, plus
+  group-owned records (`group` on the record itself).
+- **`uses`** (`ProjectInfo.uses` + `cache/uses.txt`, managed by
+  `tiered-memory use`) — directional and explicit: `b.uses = [a]` surfaces
+  a's L1 *and* L2 records in b (at b's warm tier, see §4), while a gains
+  nothing. Hot borrowed lines promote into b's L1 through normal
+  write-allocate; unlinking (`use --remove`) stops new borrowing but leaves
+  already-promoted copies in b's hot line, like any cached line. Both
+  projects must be registered; links survive re-registration and are
+  stripped when the used project is removed.
 
 ## 8. Storage
 
@@ -190,8 +211,9 @@ of a mutation (embedding happens outside), and saves after each mutation.
 {root}/                              ← user `local` (standalone default)
   meta.json                          version + embedder fingerprint
   current-project                    CLI selection marker
-  projects/<project-id>.json         ProjectInfo (descriptor, tags, similar)
+  projects/<project-id>.json         ProjectInfo (descriptor, tags, similar, uses)
   cache/
+    uses.txt                         project → project memory sources (hand-editable)
     L1/<project-id>/memories.json    records at L1 of that project (machine)
     L1/<project-id>/memories.md      regenerated human-readable mirror
     L2/memories.json                 all L2 records (flat machine store)
@@ -210,13 +232,16 @@ Design rules:
   atomic tmp+rename). Each write regenerates the layer's `memories.md` (L2:
   the per-topic files) — read, grep and diff them freely; edits go through
   the API/CLI so the two never drift silently.
-- **`similar-projects.txt` is the one authoritative human file.** One
-  symmetric pair per line (`projectA projectB`). `save` writes the union of
-  (whatever the file already contained) and (the computed links), so
-  hand-added pairs survive recomputation. On `load`, pairs are merged into the
-  projects; a pair referencing a not-yet-registered project attaches to the
-  known side and activates when the other project registers. Two unknown ids
-  is the only case that drops.
+- **The relationship files are the authoritative human files.**
+  `similar-projects.txt` holds one symmetric pair per line (`projectA
+  projectB`); `uses.txt` one directional pair per line (`using used`).
+  `save` writes the union of (whatever the file already contained) and (the
+  engine-side links), so hand-added lines survive recomputation. On `load`,
+  lines merge into the projects; a pair referencing a not-yet-registered
+  project attaches to the known side and activates when the other project
+  registers. Two unknown ids is the only case that drops. (`groups.txt` is
+  stricter: the file wins on load outright — clear an assignment with
+  `none`, not by deleting the line.)
 - **Reconciliation on save**: stale project files and L1 directories of
   removed projects are deleted; every registered project gets an L1 folder
   (empty rather than missing) so the tree always mirrors the registry.

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::{
     api_base, arg_switch, arg_value, cmd_args, data_root, default_user, flags, home_dir,
-    local_engine, resolve_project, service_or_local, store,
+    local_engine, positional, resolve_project, service_or_local, store,
 };
 use tiered_memory::{LayeredDirStore, ProjectInfo, ProjectInput, UserDb};
 
@@ -18,9 +18,9 @@ use tiered_memory::{LayeredDirStore, ProjectInfo, ProjectInput, UserDb};
 /// service when one is up), and writes a `tiered-memory.json` marker so hosts
 /// and agents can discover how to reach this project's memory.
 ///
-/// This is also the first-run wizard: it offers LLM credentials (needed by
-/// `sync`) and the `/tiered-memory` skill for the user's harnesses — each
-/// prompt once, skippable, never forced.
+/// This is also the first-run wizard: it asks for the project's L2 group,
+/// offers LLM credentials (needed by `sync`) and the `/tiered-memory` skill
+/// for the user's harnesses — each prompt once, skippable, never forced.
 pub(crate) fn init() -> Result<(), String> {
     let args = cmd_args();
     let user = arg_value(&args, "--user").unwrap_or_else(default_user);
@@ -28,6 +28,7 @@ pub(crate) fn init() -> Result<(), String> {
 
     let project_id = register_current_project(&args, &user, &cwd)?;
     write_marker(&cwd, &user, &project_id)?;
+    offer_group(&args, &user, &project_id)?;
     offer_gitignore(&args, &cwd)?;
     offer_credentials()?;
     offer_skill_install(&cwd)?;
@@ -112,6 +113,175 @@ fn write_marker(cwd: &Path, user: &str, project_id: &str) -> Result<(), String> 
 
 /// Offer to keep the marker out of version control (dev-phase projects link
 /// tiered-memory temporarily, so the default is yes).
+/// First-run: ask which L2 group the project belongs to — same ask-once
+/// semantics as the skill's protocol, just earlier. `--group <name|none>`
+/// pre-answers for scripts; Enter skips (the skill will ask at session
+/// start); an existing assignment or `none` confirmation is never re-asked.
+fn offer_group(args: &[String], user: &str, project_id: &str) -> Result<(), String> {
+    if let Some(name) = arg_value(args, "--group") {
+        return assign_group(user, project_id, &name);
+    }
+
+    let db = match store()?.load(user).map_err(|e| e.to_string())? {
+        Some(db) => db,
+        None => return Ok(()),
+    };
+    let Some(p) = db.projects.get(project_id) else {
+        return Ok(());
+    };
+    match p.group.as_deref() {
+        Some(g @ tiered_memory::NO_GROUP) => {
+            println!("L2 group: {g} (confirmed)");
+            return Ok(());
+        }
+        Some(g) => {
+            println!("L2 group: {g}");
+            return Ok(());
+        }
+        None => {}
+    }
+
+    if !crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
+        println!("hint: assign an L2 group with `tiered-memory group set <name|none>` (or re-run setup with --group)");
+        return Ok(());
+    }
+
+    println!("\nL2 group — the family of projects this one shares warm memories with.");
+    if let Some(s) = group_suggestion(&db, p) {
+        println!("suggestion: {s}");
+    }
+    match group_picker(user, project_id, &db) {
+        Some(name) => {
+            if let Err(e) = assign_group(user, project_id, &name) {
+                eprintln!(
+                    "tiered-memory: could not set the group ({e}) — run `tiered-memory group set {name}` later"
+                );
+            } else if name == tiered_memory::NO_GROUP {
+                println!("confirmed no L2 group — the skill won't ask again");
+            } else {
+                println!("`{project_id}` → L2 group `{name}`");
+            }
+        }
+        None => println!("skipped — the /tiered-memory skill will ask at session start"),
+    }
+    Ok(())
+}
+
+/// All L2 groups with their member project ids, name-sorted. Includes groups
+/// that only group-owned memories carry (no member projects yet). The
+/// reserved `none` confirmation is not a group and never appears.
+fn groups_with_members(db: &UserDb) -> Vec<(String, Vec<String>)> {
+    let mut map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (id, p) in &db.projects {
+        if let Some(g) = p.group.as_deref().filter(|g| *g != tiered_memory::NO_GROUP) {
+            map.entry(g.to_string()).or_default().push(id.clone());
+        }
+    }
+    for r in &db.records {
+        if let Some(g) = r.group.as_deref().filter(|g| *g != tiered_memory::NO_GROUP) {
+            map.entry(g.to_string()).or_default();
+        }
+    }
+    map.into_iter().collect()
+}
+
+/// "`rust-clis` (3: a, b, +1 more)"-style label for a group + its members.
+fn group_label(name: &str, members: &[String]) -> String {
+    if members.is_empty() {
+        format!("{name} (no member projects — only group-owned memories)")
+    } else {
+        let shown: Vec<&str> = members.iter().take(3).map(String::as_str).collect();
+        let more = members.len() - shown.len();
+        let list = if more > 0 {
+            format!("{}, … +{more} more", shown.join(", "))
+        } else {
+            shown.join(", ")
+        };
+        format!("{name} ({}: {})", members.len(), list)
+    }
+}
+
+/// The interactive group choice: join an existing group by number, found a
+/// new one (optionally seeding it with other projects), record `none`, or
+/// skip. Returns the group name to assign, `Some("none")` for the explicit
+/// no-group confirmation, and `None` for skip. Raw group names are still
+/// accepted for power users — with the near-miss guard.
+fn group_picker(user: &str, project_id: &str, db: &UserDb) -> Option<String> {
+    let groups = groups_with_members(db);
+    if !groups.is_empty() {
+        println!("existing groups:");
+        for (i, (g, members)) in groups.iter().enumerate() {
+            println!("  [{}] {}", i + 1, group_label(g, members));
+        }
+    }
+    println!("  [n] new group    [x] none    [Enter] skip (asked again later)");
+    print!("choice: ");
+    std::io::stdout().flush().map_err(|e| e.to_string()).ok()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).ok()?;
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "x" | "none" => Some(tiered_memory::NO_GROUP.to_string()),
+        "n" | "new" => new_group_flow(user, db, project_id),
+        n => {
+            if let Ok(i) = n.parse::<usize>() {
+                groups.get(i.checked_sub(1)?).map(|(g, _)| g.clone())
+            } else {
+                // typed a raw group name — the old flow, guarded
+                Some(n.to_string())
+            }
+        }
+    }
+}
+
+/// Found a new group: name it once, then optionally seed it with other
+/// registered projects (the project being init'ed is excluded) so the family
+/// exists from day one.
+fn new_group_flow(user: &str, db: &UserDb, project_id: &str) -> Option<String> {
+    print!("name the new group (e.g. rust-clis, web-apps): ");
+    std::io::stdout().flush().map_err(|e| e.to_string()).ok()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).ok()?;
+    let name = line.trim().to_string();
+    if name.is_empty() {
+        println!("no name — skipping");
+        return None;
+    }
+
+    let others: Vec<&String> = db
+        .projects
+        .keys()
+        .filter(|id| id.as_str() != project_id)
+        .collect();
+    if !others.is_empty() {
+        println!("seed the group with other projects (comma-separated, Enter for none):");
+        for (i, id) in others.iter().enumerate() {
+            println!("  [{}] {}", i + 1, id);
+        }
+        print!("seed: ");
+        std::io::stdout().flush().map_err(|e| e.to_string()).ok()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).ok()?;
+        for token in line.split([',', ' ', ';']).map(str::trim).filter(|t| !t.is_empty()) {
+            let picked = match token.parse::<usize>() {
+                Ok(i) => others.get(i.checked_sub(1)?).map(|s| s.as_str()),
+                Err(_) => others
+                    .iter()
+                    .find(|id| id.as_str() == token)
+                    .map(|s| s.as_str()),
+            };
+            match picked {
+                Some(id) => match assign_group(user, id, &name) {
+                    Ok(()) => println!("  seeded `{id}` → `{name}`"),
+                    Err(e) => eprintln!("  could not seed `{id}`: {e}"),
+                },
+                None => eprintln!("  (unknown project `{token}` — skipped)"),
+            }
+        }
+    }
+    Some(name)
+}
+
 fn offer_gitignore(args: &[String], cwd: &Path) -> Result<(), String> {
     let gitignore = cwd.join(".gitignore");
     let want_ignore = if arg_switch(args, "--gitignore") {
@@ -327,12 +497,18 @@ pub(crate) fn projects() -> Result<(), String> {
         } else {
             p.name.as_str()
         };
+        let uses = if p.uses.is_empty() {
+            String::new()
+        } else {
+            format!("  uses: {}", p.uses.join(", "))
+        };
         println!(
-            "  {id:<24} L1 {l1:>3}  similar: {:?}  {name}{cur}",
+            "  {id:<24} L1 {l1:>3}  similar: {:?}{uses}  {name}{cur}",
             p.similar
         );
     }
     println!("\nselect one with: tiered-memory select --user {user} [--project <id>]");
+    println!("draw on one with: tiered-memory use <id> (this project sees its L1+L2)");
     println!("remove one with: tiered-memory projects remove <id> [--user {user}]");
     Ok(())
 }
@@ -430,8 +606,10 @@ pub(crate) fn group_cmd() -> Result<(), String> {
     let args = cmd_args();
     let user = arg_value(&args, "--user").unwrap_or_else(default_user);
 
-    if args.first().map(String::as_str) == Some("set") {
-        return group_set(&args, &user);
+    match args.first().map(String::as_str) {
+        Some("set") => return group_set(&args, &user),
+        Some("rename") => return group_rename(&args, &user),
+        _ => {}
     }
     group_show(&args, &user)
 }
@@ -441,23 +619,9 @@ fn group_set(args: &[String], user: &str) -> Result<(), String> {
         .get(1)
         .filter(|s| !s.starts_with('-'))
         .ok_or("usage: tiered-memory group set <name|none> [--project P]")?;
+    near_miss_guard(user, name)?;
     let project = resolve_project(args, user)?;
-    let body = serde_json::json!({
-        "user": user,
-        "project_id": project,
-        "group": name,
-    });
-    service_or_local(
-        "/v1/projects/group",
-        &body,
-        |_| Ok(()),
-        || {
-            local_engine()?
-                .set_project_group(user, &project, Some(name))
-                .map_err(|e| e.to_string())
-                .map(|_| ())
-        },
-    )?;
+    assign_group(user, &project, name)?;
 
     if name == tiered_memory::NO_GROUP {
         println!("`{project}`: confirmed no L2 group — the /tiered-memory skill won't ask again");
@@ -484,6 +648,127 @@ fn group_set(args: &[String], user: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `group rename <old> <new>` — fix the ambiguity after the fact: move every
+/// project and group-owned memory from one group name to another. Renaming
+/// onto an existing group **merges** the two (the fix for split families
+/// like `rustcli` vs `rust-clis`).
+fn group_rename(args: &[String], user: &str) -> Result<(), String> {
+    let positionals: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let (from, to) = match (positionals.first(), positionals.get(1)) {
+        (Some(f), Some(t)) => (f.as_str(), t.as_str()),
+        _ => return Err("usage: tiered-memory group rename <old> <new> [--user U]".into()),
+    };
+    let body = serde_json::json!({ "user": user, "from": from, "to": to });
+    service_or_local(
+        "/v1/projects/group/rename",
+        &body,
+        |out| {
+            println!(
+                "group `{from}` → `{to}`: {} project(s), {} group-owned memory/memories moved",
+                out["projects"].as_u64().unwrap_or(0),
+                out["records"].as_u64().unwrap_or(0)
+            );
+            Ok(())
+        },
+        || {
+            let (p, r) = local_engine()?
+                .rename_group(user, from, to)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "group `{from}` → `{to}`: {p} project(s), {r} group-owned memory/memories moved (local store, no service running)"
+            );
+            Ok(())
+        },
+    )
+}
+
+/// Catch group-name typos at the only cheap moment: when they're typed.
+/// Joining an existing group passes silently; a new name within edit
+/// distance 2 of an existing one asks for confirmation on a TTY — agents
+/// (non-TTY) get a loud note instead of a blocking prompt.
+fn near_miss_guard(user: &str, name: &str) -> Result<(), String> {
+    if name == tiered_memory::NO_GROUP {
+        return Ok(());
+    }
+    let Some(db) = store()?.load(user).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let existing: Vec<String> = groups_with_members(&db).into_iter().map(|(g, _)| g).collect();
+    if existing.iter().any(|g| g == name) {
+        return Ok(()); // joining an existing group — nothing to guard
+    }
+    let Some(close) = existing
+        .iter()
+        .filter(|g| edit_distance(g, name) <= 2)
+        .min_by_key(|g| edit_distance(g, name))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
+        print!("`{name}` is close to existing group `{close}` — create `{name}` anyway? [y/N] ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Err(format!(
+                "cancelled — join the existing group with `tiered-memory group set {close}`, or merge later with `tiered-memory group rename {name} {close}`"
+            ));
+        }
+    } else {
+        println!(
+            "note: `{name}` is close to existing group `{close}` — if this was a typo, merge with `tiered-memory group rename {name} {close}`"
+        );
+    }
+    Ok(())
+}
+
+/// Levenshtein distance (group names are short — the O(n·m) table is fine).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Persist a group assignment (HTTP-first, local fallback) — shared by
+/// `group set`, `init --group`, the init interactive prompt, and the picker's
+/// seed step.
+fn assign_group(user: &str, project: &str, name: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "user": user,
+        "project_id": project,
+        "group": name,
+    });
+    service_or_local(
+        "/v1/projects/group",
+        &body,
+        |_| Ok(()),
+        || {
+            local_engine()?
+                .set_project_group(user, project, Some(name))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
 fn group_show(args: &[String], user: &str) -> Result<(), String> {
     let project = resolve_project(args, user)?;
     let db = store()?
@@ -503,6 +788,14 @@ fn group_show(args: &[String], user: &str) -> Result<(), String> {
         None => {
             println!("group: (unset)");
             print_group_suggestion(&db, p);
+            let groups = groups_with_members(&db);
+            if !groups.is_empty() {
+                println!("\nexisting groups:");
+                for (g, members) in &groups {
+                    println!("  {}", group_label(g, members));
+                }
+                println!("join one with: tiered-memory group set <name>");
+            }
         }
     }
     Ok(())
@@ -510,7 +803,7 @@ fn group_show(args: &[String], user: &str) -> Result<(), String> {
 
 /// While a project is unassigned, propose the most common group among its
 /// similar projects — the same proposal the agent skill confirms with the user.
-fn print_group_suggestion(db: &UserDb, p: &ProjectInfo) {
+fn group_suggestion(db: &UserDb, p: &ProjectInfo) -> Option<String> {
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for sid in &p.similar {
         if let Some(sp) = db.projects.get(sid) {
@@ -523,16 +816,170 @@ fn print_group_suggestion(db: &UserDb, p: &ProjectInfo) {
             }
         }
     }
-    if let Some((g, n)) = counts.into_iter().max_by_key(|(_, n)| *n) {
-        println!("suggestion: {g} ({n} similar project(s) already use it)");
-    } else if !p.similar.is_empty() {
-        println!(
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(g, n)| format!("{g} ({n} similar project(s) already use it)"))
+}
+
+fn print_group_suggestion(db: &UserDb, p: &ProjectInfo) {
+    match group_suggestion(db, p) {
+        Some(s) => println!("suggestion: {s}"),
+        None if !p.similar.is_empty() => println!(
             "similar projects: {} — none grouped yet; ask which family this belongs to, or create one",
             p.similar.join(", ")
-        );
-    } else {
-        println!(
+        ),
+        None => println!(
             "no suggestion — ask the user which family of projects this belongs to (e.g. rust-clis, web-apps), or `tiered-memory group set none`"
+        ),
+    }
+}
+
+// -- use ---------------------------------------------------------------------
+
+/// `tiered-memory use` — cross-project memory sources. Bare: show what this
+/// project draws on (and who draws on it). `use <other>` links this project
+/// to `<other>`: its L1 *and* L2 memories surface here in the warm (L2) tier,
+/// and hot ones migrate into this project's L1 as they are recalled.
+/// Directional — the other project gains nothing. `use --remove <other>`
+/// drops the link again.
+pub(crate) fn use_cmd() -> Result<(), String> {
+    let args = cmd_args();
+    let user = arg_value(&args, "--user").unwrap_or_else(default_user);
+    let project = resolve_project(&args, &user)?;
+    let remove = arg_switch(&args, "--remove");
+
+    let Some(target) = positional(&args) else {
+        return use_show(&user, &project);
+    };
+    if target == project {
+        return Err(
+            "a project cannot use itself — its own memories are already visible to it".into(),
         );
     }
+
+    let (add, rm) = if remove {
+        (None, Some(target.clone()))
+    } else {
+        (Some(target.clone()), None)
+    };
+    let body = serde_json::json!({
+        "user": user,
+        "project_id": project,
+        "add": add,
+        "remove": rm,
+    });
+    let verb = if remove { "remove" } else { "add" };
+    service_or_local(
+        "/v1/projects/uses",
+        &body,
+        |out| {
+            println!(
+                "`{project}` {} `{target}`",
+                if remove {
+                    "no longer uses"
+                } else {
+                    "now uses"
+                }
+            );
+            print_uses_from(&out["uses"], &project, remove, &target);
+            Ok(())
+        },
+        || {
+            let info = if remove {
+                local_engine()?
+                    .remove_project_use(&user, &project, &target)
+                    .map_err(|e| e.to_string())?
+            } else {
+                local_engine()?
+                    .add_project_use(&user, &project, &target)
+                    .map_err(|e| e.to_string())?
+            };
+            println!(
+                "`{project}` {} `{target}` (local store, no service running)",
+                if remove {
+                    "no longer uses"
+                } else {
+                    "now uses"
+                }
+            );
+            print_uses(&info.uses, &project, verb, &target);
+            Ok(())
+        },
+    )
+}
+
+fn print_uses_from(v: &serde_json::Value, project: &str, remove: bool, target: &str) {
+    let uses: Vec<String> = v
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    print_uses(&uses, project, if remove { "remove" } else { "add" }, target);
+}
+
+/// The trailing context every `use` mutation prints: what the project draws
+/// on now, plus a consequence line for the change.
+fn print_uses(uses: &[String], project: &str, verb: &str, target: &str) {
+    match (verb, uses.is_empty()) {
+        ("add", _) => println!(
+            "  `{target}`'s L1 and L2 memories now surface in `{project}`'s warm (L2) tier — never the reverse"
+        ),
+        ("remove", true) => println!("  `{project}` draws on no other project now"),
+        _ => {}
+    }
+    if uses.is_empty() {
+        return;
+    }
+    println!("  uses: {}", uses.join(", "));
+}
+
+/// Bare `use`: this project's memory sources, and — since visibility is
+/// directional — who is drawing on this one.
+fn use_show(user: &str, project: &str) -> Result<(), String> {
+    let db = store()?
+        .load(user)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no memory yet for user `{user}`"))?;
+    let Some(p) = db.projects.get(project) else {
+        return Err(format!(
+            "project `{project}` is not registered — run `tiered-memory init` in its directory"
+        ));
+    };
+    if p.uses.is_empty() {
+        println!("`{project}` uses: (none — it sees only its own memories, L2 groups/similar links, and global L3)");
+        println!("  add a source with: tiered-memory use <other-project>");
+    } else {
+        println!("`{project}` uses (their L1+L2 surface here in the warm tier):");
+        for id in &p.uses {
+            let name = db
+                .projects
+                .get(id)
+                .map(|t| t.name.as_str())
+                .unwrap_or(id);
+            if name.is_empty() || name == id {
+                println!("  - {id}");
+            } else {
+                println!("  - {id} ({name})");
+            }
+        }
+    }
+    let used_by: Vec<&String> = db
+        .projects
+        .iter()
+        .filter(|(id, t)| id.as_str() != project && t.uses.iter().any(|s| s == project))
+        .map(|(id, _)| id)
+        .collect();
+    if used_by.is_empty() {
+        println!("used by: (nobody — `{project}`'s memories stay its own)");
+    } else {
+        println!(
+            "used by: {} — their recall and params see `{project}`'s L1+L2",
+            used_by.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
 }

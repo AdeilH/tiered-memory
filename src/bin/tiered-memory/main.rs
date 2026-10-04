@@ -20,11 +20,13 @@
 //! `remember`/`recall`. Write commands go through the running service when it
 //! is reachable (HTTP-first) so a live service and CLI writes never go stale.
 //!
-//! Module map: [`project`] (setup/init, projects, select, group) ·
+//! Module map: [`project`] (setup/init, projects, select, group, use) ·
 //! [`memory`] (remember, feedback, recall, params, sync, stats) ·
 //! [`credentials`] (LLM credentials, auth token, models) · [`service`]
-//! (serve, env) · [`skill`] (install-skill, console).
+//! (serve, env) · [`status`] (setup report) · [`skill`] (install-skill,
+//! console).
 
+mod bench;
 mod clean;
 mod credentials;
 mod hooks;
@@ -32,6 +34,7 @@ mod memory;
 mod project;
 mod service;
 mod skill;
+mod status;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,10 +52,12 @@ async fn main() {
         Some("projects") => project::projects(),
         Some("select") => project::select(),
         Some("group") => project::group_cmd(),
+        Some("use") => project::use_cmd(),
         Some("params") => memory::params(),
         Some("remember") => memory::remember(),
         Some("feedback") => memory::feedback_cmd(),
         Some("recall") => memory::recall(),
+        Some("forget") => memory::forget_cmd(),
         Some("sync") => memory::sync_cmd(),
         Some("stats") => memory::stats(),
         Some("credentials") => credentials::credentials(),
@@ -61,9 +66,11 @@ async fn main() {
         Some("install-skill") => skill::install_skill(),
         Some("install-hooks") => hooks::install_hooks_cmd(),
         Some("hook") => hooks::hook_cmd(),
+        Some("bench") => bench::bench_cmd(),
         Some("clean") => clean::clean_cmd(),
         Some("console") => skill::console_cmd(),
         Some("env") => service::print_env(),
+        Some("status") => status::status_cmd(),
         Some("help") | Some("--help") | Some("-h") => {
             print_usage();
             Ok(())
@@ -84,21 +91,37 @@ fn print_usage() {
 
 USAGE:
   tiered-memory serve                    start the HTTP service on {DEFAULT_BIND}
-  tiered-memory setup | init [--name N] [--id ID] [--descriptor T] [--user U]
-                                         [--gitignore]
+  tiered-memory setup | init [--name N] [--id ID] [--descriptor T]
+                                         [--group NAME|none] [--user U] [--gitignore]
                                          set THIS directory up as a project:
-                                         register, offer LLM credentials and the
-                                         /tiered-memory skill for your harness(es)
-                                         (scripts: --gitignore pre-answers the
-                                         gitignore prompt)
+                                         register, ask its L2 group, offer LLM
+                                         credentials and the /tiered-memory skill
+                                         for your harness(es) (scripts: --group and
+                                         --gitignore pre-answers the prompts)
   tiered-memory projects [--user U]      list projects using tiered memory
   tiered-memory projects remove <id>     unregister a project + forget its records
   tiered-memory select  [--user U] [--project P]
                                          pick the current project (interactive without P)
   tiered-memory group [--project P] [--user U]
                                          show this project's L2 group (+ suggestion
-                                         when unset); `group set <name|none>` assigns
-                                         it (asked once per project by the skill)
+                                         and the existing groups when unset);
+                                         `group set <name|none>` assigns it (asked
+                                         once per project by the skill);
+                                         `group rename <old> <new>` moves every
+                                         project + group-owned memory — renaming
+                                         onto an existing group merges the two
+  tiered-memory status [--user U] [--check]
+                                         one-glance setup report: service, data
+                                         dir, project resolution, L2 group, LLM
+                                         credentials (--check exits 1 when this
+                                         directory isn't set up, for
+                                         `status --check || init`)
+  tiered-memory use [--project P] [--user U]
+                                         show this project's memory sources — and
+                                         who is drawing on it
+  tiered-memory use <other>              this project now also sees <other>'s L1+L2
+                                         memories (its warm tier; never the reverse)
+  tiered-memory use --remove <other>     stop drawing on <other>
   tiered-memory params  [--user U] [--project P]
                                          show the adjusted parameter set
   tiered-memory remember \"text\" [--project P] [--kind KIND]
@@ -113,6 +136,10 @@ USAGE:
                                          (the agent-facing signal API)
   tiered-memory recall \"query\" [--project P] [--k N] [--min F] [--user U]
                                          layered search
+  tiered-memory forget <id> | --project P | --level L1|L2|L3 | --all [--yes]
+                                         delete memories (the right to be
+                                         forgotten — what was remembered can
+                                         be un-remembered; --all confirms)
   tiered-memory sync [--file F | --text T | --stdin] [--project P] [--user U]
                      [--dry-run]
                                          gather all 3 layers, extract new/changed
@@ -145,6 +172,13 @@ USAGE:
                                          the data dir (memories + LLM credentials)
                                          and installed agent skill copies — asks
                                          for confirmation unless --yes
+  tiered-memory bench [--projects N] [--per-project N] [--queries N]
+                      [--embedder hashing|local|http] [--keep] [--json]
+                                         benchmark write/recall/consolidate on a
+                                         deterministic synthetic corpus in a
+                                         scratch store (real data is never touched);
+                                         compare environments via TM_EMBEDDER /
+                                         TM_DATA_DIR and diff the tables
   tiered-memory env                      print exports for `eval \"$(tiered-memory env)\"`
                                          (PATH + TM_DATA_DIR; a process cannot
                                          export into its parent shell itself)
@@ -335,27 +369,42 @@ fn api_base() -> String {
     std::env::var("TM_BASE_URL").unwrap_or_else(|_| format!("http://{DEFAULT_BIND}"))
 }
 
+/// Attach the service bearer token, if one is on disk.
+fn with_service_auth<S>(req: ureq::RequestBuilder<S>) -> ureq::RequestBuilder<S> {
+    if let Ok(token) = std::fs::read_to_string(data_root().join("token")) {
+        let t = token.trim();
+        if !t.is_empty() {
+            return req.header("Authorization", &format!("Bearer {t}"));
+        }
+    }
+    req
+}
+
+/// Classify a response from the running service. Statuses are not errors
+/// (`http_status_as_error(false)`) so the error body can be surfaced.
+fn api_response(mut resp: ureq::http::Response<ureq::Body>) -> Api {
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let msg = resp.body_mut().read_to_string().unwrap_or_default();
+        return Api::Err(format!("service returned {status}: {msg}"));
+    }
+    match resp.body_mut().read_json::<serde_json::Value>() {
+        Ok(v) => Api::Ok(v),
+        Err(e) => Api::Err(format!("unreadable response from service: {e}")),
+    }
+}
+
 /// POST to the running service, if there is one. `Err` means the service IS
 /// reachable but rejected the call (surface it — don't silently fall back);
 /// `Unreachable` lets the caller use the local store directly.
 pub(crate) fn api_post(path: &str, body: &serde_json::Value) -> Api {
-    let mut req = ureq::post(&format!("{}{}", api_base(), path))
-        .timeout(std::time::Duration::from_millis(2000));
-    if let Ok(token) = std::fs::read_to_string(data_root().join("token")) {
-        let t = token.trim();
-        if !t.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {t}"));
-        }
-    }
-    match req.send_json(body) {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
-            Ok(v) => Api::Ok(v),
-            Err(e) => Api::Err(format!("unreadable response from service: {e}")),
-        },
-        Err(ureq::Error::Status(code, resp)) => {
-            let msg = resp.into_string().unwrap_or_default();
-            Api::Err(format!("service returned {code}: {msg}"))
-        }
+    let req = ureq::post(&format!("{}{}", api_base(), path))
+        .config()
+        .timeout_global(Some(std::time::Duration::from_millis(2000)))
+        .http_status_as_error(false)
+        .build();
+    match with_service_auth(req).send_json(body) {
+        Ok(resp) => api_response(resp),
         Err(_) => Api::Unreachable,
     }
 }
@@ -364,46 +413,26 @@ pub(crate) fn api_post(path: &str, body: &serde_json::Value) -> Api {
 /// Lets read-side callers (the session-start hook) see the running service's
 /// store instead of stale local disk.
 pub(crate) fn api_get(path: &str) -> Api {
-    let mut req = ureq::get(&format!("{}{}", api_base(), path))
-        .timeout(std::time::Duration::from_millis(2000));
-    if let Ok(token) = std::fs::read_to_string(data_root().join("token")) {
-        let t = token.trim();
-        if !t.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {t}"));
-        }
-    }
-    match req.call() {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
-            Ok(v) => Api::Ok(v),
-            Err(e) => Api::Err(format!("unreadable response from service: {e}")),
-        },
-        Err(ureq::Error::Status(code, resp)) => {
-            let msg = resp.into_string().unwrap_or_default();
-            Api::Err(format!("service returned {code}: {msg}"))
-        }
+    let req = ureq::get(&format!("{}{}", api_base(), path))
+        .config()
+        .timeout_global(Some(std::time::Duration::from_millis(2000)))
+        .http_status_as_error(false)
+        .build();
+    match with_service_auth(req).call() {
+        Ok(resp) => api_response(resp),
         Err(_) => Api::Unreachable,
     }
 }
 
 /// DELETE counterpart of [`api_get`] — same auth, same Unreachable semantics.
 pub(crate) fn api_delete(path: &str) -> Api {
-    let mut req = ureq::delete(&format!("{}{}", api_base(), path))
-        .timeout(std::time::Duration::from_millis(2000));
-    if let Ok(token) = std::fs::read_to_string(data_root().join("token")) {
-        let t = token.trim();
-        if !t.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {t}"));
-        }
-    }
-    match req.call() {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
-            Ok(v) => Api::Ok(v),
-            Err(e) => Api::Err(format!("unreadable response from service: {e}")),
-        },
-        Err(ureq::Error::Status(code, resp)) => {
-            let msg = resp.into_string().unwrap_or_default();
-            Api::Err(format!("service returned {code}: {msg}"))
-        }
+    let req = ureq::delete(&format!("{}{}", api_base(), path))
+        .config()
+        .timeout_global(Some(std::time::Duration::from_millis(2000)))
+        .http_status_as_error(false)
+        .build();
+    match with_service_auth(req).call() {
+        Ok(resp) => api_response(resp),
         Err(_) => Api::Unreachable,
     }
 }

@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 
 use crate::{arg_switch, arg_value, cmd_args, data_root, default_user, home_dir, local_engine};
 
+/// Upper bound on how much of a transcript the session-end hook will read
+/// and ship to the provider (see SECURITY_ANALYSIS.md, v0.2 additions).
+const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
+
 // -- install-hooks -----------------------------------------------------------
 
 /// `tiered-memory install-hooks [--harness <id,id>] [--remove]` — write (or
@@ -266,9 +270,28 @@ fn session_end(args: &[String], user: &str) -> Result<(), String> {
     let Some(path) = transcript_path else {
         return Ok(());
     };
-    let Ok(conversation) = std::fs::read_to_string(&path) else {
-        return Ok(());
+    // the hook reads whatever path the harness hands it — cap the read so a
+    // huge (or hostile) transcript can't blow up memory, and so the LLM call
+    // ships a bounded slice at most
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
     };
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > MAX_TRANSCRIPT_BYTES {
+            eprintln!(
+                "tiered-memory hook: transcript is {} bytes (cap {MAX_TRANSCRIPT_BYTES}) — syncing only the first {MAX_TRANSCRIPT_BYTES}",
+                meta.len()
+            );
+        }
+    }
+    let mut conversation = String::new();
+    if std::io::Read::take(file, MAX_TRANSCRIPT_BYTES)
+        .read_to_string(&mut conversation)
+        .is_err()
+    {
+        return Ok(()); // not valid UTF-8 — not ours to parse
+    }
     if conversation.trim().is_empty() {
         return Ok(());
     }

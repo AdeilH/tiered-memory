@@ -58,9 +58,12 @@ pub(crate) fn rank(c: &Candidate<'_>, now_ms: u64, half_life_days: f32) -> f32 {
 }
 
 /// Derive the adjusted parameter set from a list of *already visibility-filtered*
-/// records (the caller decides which records a project may see).
+/// records (the caller decides which records a project may see). `viewer` is
+/// the project the view is for — a used project's L1 assertions serve from the
+/// warm L2 tier, so the viewer's own hot lines always win their keys.
 pub fn collect_suggestions(
     records: &[&MemoryRecord],
+    viewer: Option<&str>,
     now_ms: u64,
     half_life_days: f32,
     numeric_tolerance: f64,
@@ -69,9 +72,10 @@ pub fn collect_suggestions(
     // promoted copies: prefer the shallowest level for the same value)
     let mut by_key: BTreeMap<String, Vec<Candidate<'_>>> = BTreeMap::new();
     for r in records {
+        let serving = r.serving_level_for(viewer);
         for (key, value) in &r.params {
             let cand = Candidate {
-                level: r.level,
+                level: serving,
                 value,
                 confidence: r.confidence,
                 updated_at_ms: r.last_used_at_ms.max(r.created_at_ms),
@@ -223,7 +227,7 @@ mod tests {
             0.8,
             3_000,
         );
-        let out = collect_suggestions(&[&l1, &l3, &style], 60_000, 45.0, 0.15);
+        let out = collect_suggestions(&[&l1, &l3, &style], Some("projA"), 60_000, 45.0, 0.15);
         let diff = out.iter().find(|s| s.key == "difficulty").unwrap();
         assert_eq!(diff.value, ParamValue::Number(0.3));
         assert_eq!(diff.source, Level::L1);
@@ -249,7 +253,7 @@ mod tests {
             0.9,
             9_000,
         );
-        let out = collect_suggestions(&[&old, &new], 10_000, 45.0, 0.15);
+        let out = collect_suggestions(&[&old, &new], Some("projA"), 10_000, 45.0, 0.15);
         assert_eq!(out[0].value, ParamValue::Text("short".into()));
     }
 

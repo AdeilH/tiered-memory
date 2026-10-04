@@ -20,6 +20,16 @@ projects` to list them, or `cd` into the project and `tiered-memory init`).
 
 ## Session protocol
 
+### 0. Ensure setup (only when needed)
+
+Run `tiered-memory status` first. If it reports **not set up for this
+directory**, run `tiered-memory init` right there: non-interactive runs
+auto-detect the project (package.json / Cargo.toml / pyproject.toml / the
+directory name), register it, and write the `tiered-memory.json` marker —
+the optional prompts (group, LLM credentials, skill install) degrade to
+printed hints, so nothing blocks. Then continue with step 1. If status says
+the directory is already set up, skip straight to step 1.
+
 ### 1. Session start — load the profile
 
 Run these immediately, before teaching anything:
@@ -35,14 +45,25 @@ prior knowledge. Empty output means a new learner — calibrate by asking a
 couple of questions, then store what you learn (step 2).
 
 **Group check (once per project).** If `tiered-memory group` prints
-`group: (unset)`, this project has no L2 group yet. At a natural pause (don't
-interrupt the flow), either confirm the printed **suggestion** with the user
-or ask one short question: *"Which family of projects does this belong to —
-e.g. rust-clis, web-apps, tutors — or none?"* Then run
-`tiered-memory group set <name>` (or `group set none` if they say none).
-Never re-ask once a group is set or confirmed `none` — the user's answer is
-authoritative and the suggestion was only a proposal. Grouping matters: L2
-memories of this project surface to its group-mates and theirs to it.
+`group: (unset)`, this project has no L2 group yet — the output also lists
+the **existing groups**. At a natural pause (don't interrupt the flow),
+present those options to the user: joining an existing group is one command
+and needs no naming; only found a **new** group when none fits (confirm the
+printed suggestion if there is one). Then run `tiered-memory group set <name>`
+(or `group set none` if they say none). Never re-ask once a group is set or
+confirmed `none` — the user's answer is authoritative and the suggestion was
+only a proposal. Grouping matters: L2 memories of this project surface to its
+group-mates and theirs to it. If `group set` prints a near-miss note
+("close to existing group …"), surface it to the user instead of proceeding
+blindly — `tiered-memory group rename <old> <new>` merges split families.
+
+**Memory sources.** `tiered-memory use` shows which projects this one draws
+on — their L1 *and* L2 memories surface here in the warm tier, so a borrowed
+line may answer a recall even though this project never stored it. If the
+learner says another project's knowledge should apply here ("treat it like my
+rust-cli project"), run `tiered-memory use <that-project>`. The link is
+directional (the other project gains nothing) and persists until
+`tiered-memory use --remove <project>`.
 
 ### 2. During the session — capture signals as they happen
 
@@ -133,10 +154,15 @@ above, and store them with `remember` / `feedback`.
 ## Commands reference
 
 ```bash
+tiered-memory status                     # setup report (start here; `--check` exits 1 if unset)
 tiered-memory params                     # adjusted parameters for this project
 tiered-memory recall "query"             # layer-annotated search
-tiered-memory group                      # this project's L2 group (+ suggestion)
+tiered-memory group                      # this project's L2 group (+ existing groups when unset)
 tiered-memory group set <name|none>      # assign the L2 group (once per project)
+tiered-memory group rename <old> <new>   # rename everywhere; onto an existing group = merge
+tiered-memory use                        # this project's memory sources (+ used-by)
+tiered-memory use <other>                # also see <other>'s L1+L2 here (warm tier)
+tiered-memory use --remove <other>       # stop drawing on <other>
 tiered-memory remember "text" [--param k=v]… [--global | --level L2 --topic T | --group NAME --topic T] [--pin]
 tiered-memory feedback <key> <value> [--global]
 tiered-memory projects                   # every project using tiered memory

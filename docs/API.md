@@ -9,7 +9,7 @@ reindex), 500 (storage/embedder failure).
 ## `GET /v1/health`
 
 ```json
-{ "ok": true, "version": "0.1.0", "embedder": "hashing:512", "dims": 512, "users": 3 }
+{ "ok": true, "version": "0.1.0", "embedder": "minilm:384", "dims": 384, "users": 3 }
 ```
 
 ## `GET /v1/stats/{user}`
@@ -52,6 +52,36 @@ skill asks about once per project. Group members see each other's L2 memories.
 ```
 `"group": "none"` records an explicit no-group confirmation (the skill stops
 asking); `"group": null` resets to unassigned. → the stored `ProjectInfo`.
+
+## `POST /v1/projects/group/rename`
+
+Rename an L2 group everywhere at once — every assigned project and every
+group-owned memory moves. Renaming onto an existing group **merges** the two
+(the fix for split families like `rustcli` vs `rust-clis`).
+
+```json
+{ "user": "adeel", "from": "rustcli", "to": "rust-clis" }
+```
+→ `{"projects": 2, "records": 1}` (400 when `from` matches nothing, `to` is
+reserved/invalid, or both names are equal).
+
+## `POST /v1/projects/uses`
+
+Link one project's memory into another — the explicit, **directional**
+cross-project reuse (groups share warm memories symmetrically; `uses` makes
+*this* project draw on one *specific* project, hot lines included). Exactly
+one of `add` / `remove`:
+
+```json
+{ "user": "adeel", "project_id": "student", "add": "teacher" }
+```
+
+`student` now sees `teacher`'s L1 **and** L2 memories — serving from
+student's warm L2 tier (its own L1 still wins), with hot lines migrating
+into student's L1 via write-allocate as they keep being recalled.
+`teacher` gains nothing. `{"remove": "teacher"}` drops the link; both
+projects must be registered (404 otherwise), `add` is idempotent.
+→ the stored `ProjectInfo` with the updated `uses: [...]`.
 
 ## `GET /v1/projects/{user}`
 

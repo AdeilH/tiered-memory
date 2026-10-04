@@ -64,17 +64,18 @@ impl Embedder for HttpEmbedder {
         }
         let mut req = ureq::post(&self.url);
         if let Some(key) = &self.api_key {
-            req = req.set("Authorization", &format!("Bearer {key}"));
+            req = req.header("Authorization", &format!("Bearer {key}"));
         }
         let body = serde_json::json!({
             "input": texts,
             "model": self.model,
         });
-        let resp = req
+        let mut resp = req
             .send_json(body)
             .map_err(|e| MemoryError::Embedder(format!("embeddings request failed: {e}")))?;
         let parsed: serde_json::Value = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| MemoryError::Embedder(format!("bad embeddings response: {e}")))?;
         let data = parsed
             .get("data")

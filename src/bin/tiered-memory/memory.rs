@@ -2,7 +2,7 @@
 //! `stats` — the day-to-day surface agents and scripts call.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 
 use crate::{
     arg_switch, arg_value, cmd_args, data_root, default_user, flags, local_engine, positional,
@@ -449,6 +449,89 @@ fn fmt_params(params: &BTreeMap<String, ParamValue>) -> String {
         .map(|(k, v)| format!("{k}={}", v.as_text()))
         .collect();
     format!(" {{{}}}", pairs.join(", "))
+}
+
+// -- forget ------------------------------------------------------------------
+
+/// `tiered-memory forget` — delete memories. Exactly one target:
+/// `<id>` positional, `--project P`, `--level L1|L2|L3`, or `--all`
+/// (which asks for confirmation; scripts add `--yes`). This is the command
+/// behind "never store secrets" — what was remembered can be un-remembered.
+pub(crate) fn forget_cmd() -> Result<(), String> {
+    let args = cmd_args();
+    let user = arg_value(&args, "--user").unwrap_or_else(default_user);
+    let id = positional(&args);
+    let project = arg_value(&args, "--project");
+    let level = parse_level(&args)?;
+    let all = arg_switch(&args, "--all");
+    let assume_yes = arg_switch(&args, "--yes");
+
+    let targets = [id.is_some(), project.is_some(), level.is_some(), all];
+    if targets.iter().filter(|t| **t).count() != 1 {
+        return Err(
+            "usage: tiered-memory forget <id> | forget --project P | forget --level L1|L2|L3 | forget --all [--yes]"
+                .into(),
+        );
+    }
+    if all && !assume_yes {
+        if !crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
+            return Err(
+                "forget --all deletes every memory — pass --yes to confirm in scripts".into(),
+            );
+        }
+        print!("delete ALL memories for `{user}`? This cannot be undone. [y/N] ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("forget cancelled — nothing was removed");
+            return Ok(());
+        }
+    }
+
+    let body = serde_json::json!({
+        "user": user,
+        "id": id,
+        "project_id": project,
+        "level": level,
+        "all": all.then_some(true),
+    });
+    service_or_local(
+        "/v1/forget",
+        &body,
+        |out| {
+            println!(
+                "forgot {} {}",
+                out.as_u64().unwrap_or(0),
+                plural(out.as_u64().unwrap_or(0))
+            );
+            Ok(())
+        },
+        || {
+            let n = local_engine()?
+                .forget(tiered_memory::ForgetInput {
+                    user: user.clone(),
+                    id,
+                    project_id: project,
+                    level,
+                    all: all.then_some(true),
+                })
+                .map_err(|e| e.to_string())?;
+            println!("forgot {n} {}", plural(n as u64));
+            Ok(())
+        },
+    )
+}
+
+fn plural(n: u64) -> &'static str {
+    if n == 1 {
+        "memory"
+    } else {
+        "memories"
+    }
 }
 
 // -- stats -------------------------------------------------------------------

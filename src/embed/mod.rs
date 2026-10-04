@@ -4,8 +4,8 @@
 //!
 //! | Backend | Feature | Notes |
 //! |---|---|---|
-//! | [`hashing::HashingEmbedder`] | always | dependency-free, deterministic, lexical similarity only; great for tests/offline |
-//! | [`local::LocalEmbedder`] | `local` | real sentence embeddings **in-process** (candle + safetensors, CPU) |
+//! | [`local::LocalEmbedder`] | `local` | real sentence embeddings **in-process** (candle + safetensors, CPU) — **default** (`minilm:384`) |
+//! | [`hashing::HashingEmbedder`] | always | dependency-free, deterministic, lexical similarity only; offline fallback and great for tests |
 //! | [`http::HttpEmbedder`] | `http` | any OpenAI-compatible `/embeddings` endpoint |
 
 pub mod hashing;
@@ -95,10 +95,19 @@ fn default_preset() -> String {
 }
 
 impl Default for EmbedderConfig {
+    /// `minilm:384` — the in-process MiniLM embedder. Builds without the
+    /// `local` feature fall back to the dependency-free hashing embedder.
     fn default() -> Self {
-        EmbedderConfig::Hashing {
+        #[cfg(feature = "local")]
+        return EmbedderConfig::Local {
+            model: default_preset(),
+            dir: None,
+            cache_dir: None,
+        };
+        #[cfg(not(feature = "local"))]
+        return EmbedderConfig::Hashing {
             dims: default_hashing_dims(),
-        }
+        };
     }
 }
 
@@ -136,7 +145,7 @@ impl EmbedderConfig {
     ///
     /// | Variable | Meaning |
     /// |---|---|
-    /// | `TM_EMBEDDER` | `hashing` \| `local` \| `http` (default `hashing`) |
+    /// | `TM_EMBEDDER` | `local` \| `hashing` \| `http` (default `local`; `hashing` in builds without the `local` feature) |
     /// | `TM_EMBEDDER_DIMS` | dims for the hashing backend (default 512) |
     /// | `TM_MODEL` | local preset: `minilm` \| `bge-small` (default `minilm`) |
     /// | `TM_MODEL_DIR` | local model directory override |
@@ -146,7 +155,14 @@ impl EmbedderConfig {
     /// (`credentials.json` / `TM_LLM_*` — see `LlmConfig`); there is no
     /// separate embeddings configuration.
     pub fn from_env() -> Result<Self> {
-        let kind = std::env::var("TM_EMBEDDER").unwrap_or_else(|_| "hashing".into());
+        let kind = std::env::var("TM_EMBEDDER").unwrap_or_else(|_| {
+            if cfg!(feature = "local") {
+                "local"
+            } else {
+                "hashing"
+            }
+            .into()
+        });
         match kind.as_str() {
             "hashing" => Ok(EmbedderConfig::Hashing {
                 dims: std::env::var("TM_EMBEDDER_DIMS")

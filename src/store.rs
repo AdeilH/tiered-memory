@@ -1,15 +1,17 @@
 //! Persistence backends behind the [`MemoryStore`] trait:
 //!
 //! * [`LayeredDirStore`] — the default. Mirrors the cache hierarchy on disk:
-//!   `cache/L1/<project>/`, `cache/L2/` (one big MD + `similar-projects.txt`),
-//!   `cache/L3/`. JSON files are the machine-authoritative record; every layer
-//!   also gets a human-readable `memories.md` mirror regenerated on each write.
+//!   `cache/L1/<project>/`, `cache/L2/` (per-group, per-topic docs +
+//!   `similar-projects.txt`), `cache/L3/`, plus the hand-editable
+//!   `cache/uses.txt` for cross-project memory sources. JSON files are the
+//!   machine-authoritative record; every layer also gets a human-readable
+//!   `memories.md` mirror regenerated on each write.
 //! * [`JsonFileStore`] — one JSON file per user; simple flat alternative.
 
 use crate::error::{MemoryError, Result};
 use crate::types::{Level, MemoryKind, MemoryRecord, ProjectInfo, UserDb};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -135,30 +137,31 @@ impl MemoryStore for JsonFileStore {
 // LayeredDirStore — the cache hierarchy as directories
 // ---------------------------------------------------------------------------
 
-/// Layout (root defaults to `~/tiered-memory`):
-///
-/// ```text
-/// {root}/                              ← user `local` (the standalone default)
-///   meta.json                          store version + embedder fingerprint
-///   current-project                    CLI selection marker (project id)
-///   projects/<project-id>.json         project descriptors
-///   cache/
-///     L1/<project-id>/memories.json    hot, project-scoped records (machine)
-///     L1/<project-id>/memories.md      …human-readable mirror
-///     L2/memories.json                 related-scope records (flat machine store)
-///     L2/groups/<group>/<topic>.md     human-readable docs per group + topic
-///     L2/ungrouped/<topic>.md          …for projects without a group
-///     L2/groups.txt                    project → group membership (hand-editable)
-///     L2/similar-projects.txt          project similarity links (hand-editable)
-///     L3/memories.json|md              user-level traits common to all projects
-///   users/<other-user>/…                additional users (server mode)
-/// ```
-///
-/// The JSON files are authoritative (ids, vectors, timestamps are not
-/// human-editable); the `.md` files are regenerated mirrors — read, grep and
-/// diff them, but edit through the API/CLI. `similar-projects.txt` is the
-/// exception: it *is* authoritative for links and hand-added pairs survive
-/// automatic recomputation.
+    /// Layout (root defaults to `~/tiered-memory`):
+    ///
+    /// ```text
+    /// {root}/                              ← user `local` (the standalone default)
+    ///   meta.json                          store version + embedder fingerprint
+    ///   current-project                    CLI selection marker (project id)
+    ///   projects/<project-id>.json         project descriptors
+    ///   cache/
+    ///     uses.txt                         project → project memory sources (hand-editable)
+    ///     L1/<project-id>/memories.json    hot, project-scoped records (machine)
+    ///     L1/<project-id>/memories.md      …human-readable mirror
+    ///     L2/memories.json                 related-scope records (flat machine store)
+    ///     L2/groups/<group>/<topic>.md     human-readable docs per group + topic
+    ///     L2/ungrouped/<topic>.md          …for projects without a group
+    ///     L2/groups.txt                    project → group membership (hand-editable)
+    ///     L2/similar-projects.txt          project similarity links (hand-editable)
+    ///     L3/memories.json|md              user-level traits common to all projects
+    ///   users/<other-user>/…                additional users (server mode)
+    /// ```
+    ///
+    /// The JSON files are authoritative (ids, vectors, timestamps are not
+    /// human-editable); the `.md` files are regenerated mirrors — read, grep and
+    /// diff them, but edit through the API/CLI. The relationship files are the
+    /// exception: hand-added lines in `similar-projects.txt` and `uses.txt`
+    /// survive automatic recomputation (`groups.txt` wins on load outright).
 pub struct LayeredDirStore {
     root: PathBuf,
 }
@@ -503,6 +506,39 @@ impl LayeredDirStore {
         Ok(())
     }
 
+    /// `cache/uses.txt`: cross-project memory sources — `<using> <used>`,
+    /// directional. Current links ∪ hand-added lines whose using-project is
+    /// not registered (yet); for registered projects the db is authoritative
+    /// and the CLI (`tiered-memory use --remove`) is how links are removed.
+    fn write_uses_file(user_dir: &Path, db: &UserDb) -> Result<()> {
+        let uses_path = user_dir.join("cache").join("uses.txt");
+        let known: HashSet<&str> = db.projects.keys().map(|s| s.as_str()).collect();
+        let mut entries: BTreeMap<String, BTreeSet<String>> = db
+            .projects
+            .iter()
+            .filter(|(_, p)| !p.uses.is_empty())
+            .map(|(id, p)| (id.clone(), p.uses.iter().cloned().collect()))
+            .collect();
+        for (using, used) in read_uses_file(&uses_path)? {
+            if !known.contains(using.as_str()) {
+                entries.entry(using).or_default().insert(used);
+            }
+        }
+        let mut text = String::from(
+            "# tiered-memory · cross-project memory sources\n\
+             # one per line: <using-project> <used-project> (directional —\n\
+             # `b a` means b sees a's L1+L2 memories in its warm tier)\n\
+             # hand-added lines survive; remove links with `tiered-memory use --remove <project>`\n",
+        );
+        for (using, useds) in &entries {
+            for used in useds {
+                text.push_str(&format!("{using} {used}\n"));
+            }
+        }
+        atomic_write(&uses_path, text.as_bytes())?;
+        Ok(())
+    }
+
     // -- per-section readers (used by load) -----------------------------------
 
     /// `meta.json`, or `None` when the store has never been written.
@@ -601,6 +637,21 @@ impl LayeredDirStore {
         }
         Ok(())
     }
+
+    /// `uses.txt` merges into the project registry like the links file:
+    /// hand-added lines attach to their using-project when it is registered
+    /// and stay in the file until then.
+    fn merge_uses(user_dir: &Path, db: &mut UserDb) -> Result<()> {
+        let uses_path = user_dir.join("cache").join("uses.txt");
+        for (using, used) in read_uses_file(&uses_path)? {
+            if let Some(p) = db.projects.get_mut(&using) {
+                if !p.uses.iter().any(|s| s == &used) {
+                    p.uses.push(used);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl MemoryStore for LayeredDirStore {
@@ -621,6 +672,7 @@ impl MemoryStore for LayeredDirStore {
         Self::read_flat_layer(&user_dir, Level::L3, &mut db)?;
         Self::merge_similar_links(&user_dir, &mut db)?;
         Self::merge_group_membership(&user_dir, &mut db)?;
+        Self::merge_uses(&user_dir, &mut db)?;
 
         Ok(Some(db))
     }
@@ -647,6 +699,7 @@ impl MemoryStore for LayeredDirStore {
         Self::write_l2_layer(&user_dir, db)?;
         Self::write_l3_layer(&user_dir, db)?;
         Self::write_similar_links(&user_dir, db)?;
+        Self::write_uses_file(&user_dir, db)?;
         Ok(())
     }
 
@@ -678,6 +731,7 @@ fn skeleton_project(project_id: &str) -> ProjectInfo {
         descriptor: project_id.to_string(),
         descriptor_vector: Vec::new(),
         similar: Vec::new(),
+        uses: Vec::new(),
         group: None,
         created_at_ms: crate::engine::system_now_ms(),
     }
@@ -770,6 +824,39 @@ fn read_groups_file(path: &Path) -> Result<Vec<(String, String)>> {
             continue;
         }
         out.push((pid.to_string(), g.to_string()));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// `cache/uses.txt` reader — `<using> <used>` directional pairs; self-pairs
+/// and malformed ids are skipped. Sorted + deduped like the other link files.
+fn read_uses_file(path: &Path) -> Result<Vec<(String, String)>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(MemoryError::Storage(format!(
+                "read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let (Some(using), Some(used)) = (tokens.next(), tokens.next()) else {
+            continue;
+        };
+        if !valid_path_segment(using) || !valid_path_segment(used) || using == used {
+            continue;
+        }
+        out.push((using.to_string(), used.to_string()));
     }
     out.sort();
     out.dedup();
@@ -897,6 +984,7 @@ mod tests {
                 descriptor: "tutoring app".into(),
                 descriptor_vector: vec![],
                 similar: vec!["music".into()],
+                uses: vec![],
                 group: None,
                 created_at_ms: 1,
             },
@@ -911,6 +999,7 @@ mod tests {
                 descriptor: "piano".into(),
                 descriptor_vector: vec![],
                 similar: vec!["teacher".into()],
+                uses: vec![],
                 group: None,
                 created_at_ms: 1,
             },
@@ -969,6 +1058,7 @@ mod tests {
                 descriptor: "alpha".into(),
                 descriptor_vector: vec![],
                 similar: vec![],
+                uses: vec![],
                 group: None,
                 created_at_ms: 1,
             },
@@ -1006,6 +1096,7 @@ mod tests {
                     descriptor: id.into(),
                     descriptor_vector: vec![],
                     similar: vec![],
+                    uses: vec![],
                     group: group.map(|g| g.to_string()),
                     created_at_ms: 1,
                 },
@@ -1106,6 +1197,7 @@ mod tests {
                 descriptor: "a".into(),
                 descriptor_vector: vec![],
                 similar: vec![],
+                uses: vec![],
                 group: None,
                 created_at_ms: 1,
             },
@@ -1124,6 +1216,84 @@ mod tests {
         let store = JsonFileStore::new(dir.path()).unwrap();
         assert!(store.save("../evil", &UserDb::new("x".into(), 1)).is_err());
         assert!(store.save(".hidden", &UserDb::new("x".into(), 1)).is_err());
+    }
+
+    #[test]
+    fn uses_file_roundtrip_directional_with_hand_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LayeredDirStore::new(dir.path()).unwrap();
+
+        let mut db = UserDb::new("hashing:512".into(), 512);
+        for (id, uses) in [("a", vec!["b"]), ("b", vec![])] {
+            db.projects.insert(
+                id.into(),
+                ProjectInfo {
+                    project_id: id.into(),
+                    name: id.into(),
+                    tags: vec![],
+                    components: vec![],
+                    descriptor: id.into(),
+                    descriptor_vector: vec![],
+                    similar: vec![],
+                    uses: uses.into_iter().map(String::from).collect(),
+                    group: None,
+                    created_at_ms: 1,
+                },
+            );
+        }
+        store.save(LOCAL_USER, &db).unwrap();
+
+        // directional pairs, one per line — `b a` is NOT the same link
+        let path = dir.path().join("cache/uses.txt");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.lines().any(|l| l == "a b"), "{text}");
+        assert!(
+            !text.lines().any(|l| l == "b a"),
+            "direction matters: {text}"
+        );
+
+        // hand-added lines attach to their registered using-project on the
+        // next load (the save below uses that loaded db — like every engine
+        // flow, which loads before it ever writes)
+        let path2 = dir.path().join("cache/uses.txt");
+        let mut text = fs::read_to_string(&path2).unwrap();
+        text.push_str("b a\nc d\n");
+        fs::write(&path2, text).unwrap();
+        let loaded = store.load(LOCAL_USER).unwrap().unwrap();
+        assert_eq!(loaded.projects["a"].uses, vec!["b".to_string()]);
+        assert_eq!(
+            loaded.projects["b"].uses,
+            vec!["a".to_string()],
+            "hand-added lines attach on load"
+        );
+        assert!(!loaded.projects.contains_key("c"));
+
+        // the loaded db persists everything; the unknown pair survives too
+        store.save(LOCAL_USER, &loaded).unwrap();
+        let text = fs::read_to_string(&path2).unwrap();
+        assert!(text.lines().any(|l| l == "b a"), "{text}");
+        assert!(text.lines().any(|l| l == "c d"), "hand edits survive: {text}");
+
+        // a project registered with the link keeps it across save + load
+        let mut db = loaded;
+        db.projects.insert(
+            "c".into(),
+            ProjectInfo {
+                project_id: "c".into(),
+                name: "c".into(),
+                tags: vec![],
+                components: vec![],
+                descriptor: "c".into(),
+                descriptor_vector: vec![],
+                similar: vec![],
+                uses: vec!["d".into()],
+                group: None,
+                created_at_ms: 1,
+            },
+        );
+        store.save(LOCAL_USER, &db).unwrap();
+        let loaded = store.load(LOCAL_USER).unwrap().unwrap();
+        assert_eq!(loaded.projects["c"].uses, vec!["d".to_string()]);
     }
 
     #[test]

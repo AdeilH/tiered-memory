@@ -1,4 +1,13 @@
-# Security analysis — tiered-memory v0.1.0
+# Security analysis — tiered-memory
+
+> **v0.2 note.** Sections 1–6 audit the original v0.1.0 surface and are kept
+> as-is; severities and fix-order references there are current unless marked
+> otherwise. Section 7 audits everything added since (hooks, harness
+> registry, `bench`, `clean`, `projects remove`, the context endpoint, and
+> the explicitly-portable store). Read section 7 first if you only care
+> about the current deltas.
+
+## v0.1.0 scope
 
 Review scope: all first-party code (`src/`, `skill/`, `clients/`), the HTTP
 service, CLI, sync pipeline, TUI, storage layer, and the three embedder
@@ -310,3 +319,89 @@ API contract would be cleaner failing at input validation. Move
 5. M4 pin model revision + download size cap.
 6. L2/L3 (disable redirects, body cap) — two one-liners in `llm.rs`.
 7. L4 control-char sanitizing; L5 cache bound; L6 pinned-overwrite guard.
+
+---
+
+## 7. v0.2 additions — audit of the new surface
+
+Scope added since the v0.1.0 audit: harness registry with **user-defined
+harnesses** (`{data}/harnesses.json`) and skill installs for rules-file
+harnesses; **hooks** (`install-hooks`, `hook session-start/session-end`);
+**`clean`** (bulk removal); **`projects remove`** + `DELETE
+/v1/projects/{user}/{project}`; **`GET /v1/context/…`**; **`bench`**; the
+explicitly **portable store** (documented rsync/dotfiles workflow); L2
+group/topic structures.
+
+| ID | Severity | Area | Finding |
+|---|---|---|---|
+| H2 | **High** (amplifier) | hooks × H1 | Session-start hooks auto-inject stored memories into every session's context — a poisoned memory (H1) is now *delivered* automatically, not just retrievable |
+| M6 | Medium | hook session-end | Reads an arbitrary `transcript_path` and ships its contents to the configured provider — any local process can invoke it (other local users are in scope) |
+| M7 | Medium | harnesses.json | Unvalidated custom `target` turned install/uninstall/`clean` into arbitrary path write/delete via a synced store's config (**fixed** in v0.2: relative, no `..`) |
+| M8 | Medium (open, pre-existing × new) | HTTP API | M1's DNS-rebinding surface now includes destructive `DELETE /v1/projects/...` — host-allowlist fix is more valuable than before |
+| L10 | Low | bench | Scratch dir in world-writable `/tmp` was pid-named → symlink pre-creation (**fixed**: nanos+pid name, refuse-if-exists) |
+| L11 | Low | hook session-end | Unbounded transcript read → memory blowup (**fixed**: 16 MiB cap) |
+
+### H2 — hooks deliver poisoned memory automatically (High · amplifier)
+
+`hook session-start` renders stored memories into the model's context on
+every session. That is the feature — and it upgrades H1 from "poison sits in
+the store" to "poison is injected into every conversation with no retrieval
+step that might miss it". The mitigations listed under H1 (provenance and
+trust levels, untrusted-content labelling, `--dry-run` default for sync)
+are therefore **more urgent than at v0.1**, and the brief is the first place
+trust labels should surface (e.g. annotate `derived` memories in the brief
+so the model weighs them accordingly).
+
+Consent boundary: hooks only exist if `install-hooks` ran, per harness, and
+`install-hooks --remove` strips them. The injected content is bounded (8
+memories, current parameters, group) — no conversation content leaves the
+machine at session start.
+
+### M6 — session-end ships an arbitrary file to the provider (Medium)
+
+`hook session-end` reads `transcript_path` from stdin and sends it to the
+configured LLM endpoint. Any local process can invoke the command with an
+arbitrary path — pointing it at a secret file makes tiered-memory exfiltrate
+that file's contents to the provider and persist extraction fragments as
+memories. Assessment: the consent boundary is the explicit `install-hooks`
+(the user wired the command that trusts its caller), and the provider is
+already in the trust model — but the *capability* is new.
+
+Mitigations applied in v0.2: 16 MiB read cap (L11). Worth considering
+later: restrict `transcript_path` to recognized harness transcript
+directories, or require the caller to prove harness context (e.g. stdin
+must name a live session id). Not fixed by path allowlisting alone —
+harness transcript locations move between versions.
+
+### M7 — harnesses.json targets (Medium · fixed)
+
+`install-skill`/`clean` write and delete directory trees derived from
+harness `target`s. Built-ins are trusted constants, but user-defined
+harnesses come from `{data}/harnesses.json` — and stores are *portable by
+design* (synced via dotfiles/rsync), so a malicious store can carry a
+harnesses.json the user never vetted; `target: "../../.ssh"` aimed
+install/uninstall at arbitrary paths. **Fixed**: custom targets must be
+relative and free of `..` components (absolute rejected). Built-in targets
+are unaffected. Same trust note applies to custom `label`/`note` strings
+rendered in the terminal (L4-class, self-inflicted only).
+
+### Status of v0.1 findings after v0.2
+
+* **M5 — fixed** (non-loopback binds refuse without a token).
+* **H1 — still open, priority raised** (see H2).
+* **M1 — still open, priority raised**: the loopback API is unauthenticated
+  by default and now carries a destructive `DELETE` route on top of
+  remember/forget. Host-allowlist middleware remains the small, high-value
+  fix.
+* **M3 — still open**: store files are still 0755/0644 by default
+  (credentials.json is 0600). With hooks + groups concentrating learner
+  data, 0700/0600 on the data dir and store files remains recommended.
+* **M2, M4, L2–L9 — open**, unchanged; L8 (symlinks followed on store
+  paths) now also applies to the bench scratch dir (mitigated by the
+  unpredictable name + refuse-if-exists).
+* **New operational note — single-writer assumption is load-bearing.**
+  During v0.2 development, a stale serve process resurrected deleted
+  projects from its in-memory snapshot over a CLI's local deletion. The
+  documented "single-writer per data dir" rule is not theoretical: run one
+  writer (the service *or* local CLI), and restart the service when
+  upgrading the binary. `flock` on the data root would make it enforced.

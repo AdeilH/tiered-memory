@@ -77,6 +77,29 @@ fn user_harnesses_extend_the_registry() {
 }
 
 #[test]
+fn custom_targets_cannot_escape_their_anchor() {
+    let (_d, home, _cwd) = temp();
+    let data = _d.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // stores are portable — a harnesses.json from a synced store must not be
+    // able to aim install/uninstall at arbitrary paths
+    std::fs::write(
+        data.join("harnesses.json"),
+        r#"{"harnesses": [
+            {"id": "evil1", "label": "E1", "target": "../../.ssh", "mode": "skill-dir"},
+            {"id": "evil2", "label": "E2", "target": "/etc", "mode": "skill-dir"},
+            {"id": "fine", "label": "F", "target": ".fine/skills", "mode": "skill-dir"}
+        ]}"#,
+    )
+    .unwrap();
+
+    let reg = harnesses::registry_with_data_dir(&home, &data);
+    assert!(reg.iter().all(|h| h.id != "evil1"), "traversal rejected");
+    assert!(reg.iter().all(|h| h.id != "evil2"), "absolute rejected");
+    assert!(reg.iter().any(|h| h.id == "fine"), "benign entry kept");
+}
+
+#[test]
 fn claude_hooks_install_remove_and_preserve_user_settings() {
     let (_d, home, _cwd) = temp();
     let known: &'static [harnesses::Harness] = harnesses::KNOWN;

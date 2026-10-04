@@ -42,6 +42,9 @@ pub(crate) async fn serve() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| format!("cannot bind {bind}: {e}"))?;
+    if logging_enabled() {
+        println!("tm: listening on http://{bind} — logging requests and operations (TM_QUIET=1 to silence)");
+    }
     eprintln!(
         "tiered-memory v{} | embedder {} ({} dims) | data: {} | {}",
         health.version,
@@ -74,6 +77,10 @@ fn refuse_unsafe_bind(bind: &str, root: &std::path::Path, has_token: bool) -> Re
         ));
     }
     Ok(())
+}
+
+fn logging_enabled() -> bool {
+    std::env::var("TM_QUIET").as_deref() != Ok("1")
 }
 
 // -- env ---------------------------------------------------------------------

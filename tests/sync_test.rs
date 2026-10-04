@@ -38,7 +38,8 @@ fn spawn_mock_llm(content: String) -> String {
 fn engine() -> (MemoryEngine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(LayeredDirStore::new(dir.path()).unwrap());
-    let embedder = tiered_memory::EmbedderConfig::default().build().unwrap();
+    // hashing, not Default: tests must stay offline even with `--features local`
+    let embedder = tiered_memory::EmbedderConfig::Hashing { dims: 512 }.build().unwrap();
     (
         MemoryEngine::new(store, embedder, tiered_memory::EngineConfig::default()),
         dir,

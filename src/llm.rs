@@ -127,10 +127,13 @@ impl LlmClient {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let mut req = ureq::post(&url).timeout(std::time::Duration::from_secs(120));
+        let mut req = ureq::post(&url)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(120)))
+            .build();
         if let Some(key) = &self.config.api_key {
             if !key.trim().is_empty() {
-                req = req.set("Authorization", &format!("Bearer {}", key.trim()));
+                req = req.header("Authorization", &format!("Bearer {}", key.trim()));
             }
         }
         let body = serde_json::json!({
@@ -141,11 +144,12 @@ impl LlmClient {
                 { "role": "user", "content": user }
             ],
         });
-        let resp = req
+        let mut resp = req
             .send_json(body)
             .map_err(|e| MemoryError::Embedder(format!("LLM request to {url} failed: {e}")))?;
         let parsed: ChatResponse = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| MemoryError::Embedder(format!("bad LLM response: {e}")))?;
         parsed
             .choices
@@ -202,17 +206,21 @@ pub fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>
         "{}/models",
         base_url.trim_end_matches('/')
     );
-    let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(15));
+    let mut req = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build();
     if let Some(key) = api_key {
         if !key.trim().is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", key.trim()));
+            req = req.header("Authorization", &format!("Bearer {}", key.trim()));
         }
     }
-    let resp = req
+    let mut resp = req
         .call()
         .map_err(|e| MemoryError::Embedder(format!("model list request to {url} failed: {e}")))?;
     let parsed: serde_json::Value = resp
-        .into_json()
+        .body_mut()
+        .read_json()
         .map_err(|e| MemoryError::Embedder(format!("bad model list response: {e}")))?;
     let models = parse_models_json(&parsed);
     if models.is_empty() {

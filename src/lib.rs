@@ -6,7 +6,8 @@
 //!
 //! * **L1** — tiny and hot: preferences for the project the learner is in right now.
 //! * **L2** — warm: memories from related scopes (other components of the same
-//!   project — frontend/backend — and similar projects), surfaced to the current one.
+//!   project — frontend/backend — similar projects, L2-group members, and
+//!   projects this one explicitly `use`s), surfaced to the current one.
 //! * **L3** — cold and global: traits that hold across every project.
 //!
 //! Reads probe L1 → L2 → L3 and promote what gets used (write-allocate); writes

@@ -6,7 +6,9 @@
 //!   (similarity × layer weight × confidence × recency), deduplicates
 //!   promoted copies against their canonical records, and *touches* what it
 //!   served. Repeatedly-used deeper-layer memories are copied up into L1
-//!   (write-allocate) so hot knowledge migrates toward the learner.
+//!   (write-allocate) so hot knowledge migrates toward the learner. Projects
+//!   can explicitly `use` another project: its L1+L2 lines surface in the
+//!   borrower's warm tier (directional, hot ones promote like any L2 hit).
 //! * **Write path** (`remember`/`feedback`) lands new knowledge in L1 of the
 //!   current project (or L3 for global traits), deduplicates by key or by
 //!   near-identical content, and enforces layer capacity. Evicted L1
@@ -376,20 +378,28 @@ pub struct MemoryEngine {
 
 /// Visibility of one record for a recall in `project`. `similar` is the
 /// project's explicit similarity links; `my_group` its L2 group; `groups`
-/// maps every project id to its group (effective — `none` already removed).
+/// maps every project id to its group (effective — `none` already removed);
+/// `uses` the projects this one explicitly draws memory from.
 fn visible_at(
     r: &MemoryRecord,
     project: Option<&str>,
     similar: &HashSet<String>,
     my_group: Option<&str>,
     groups: &HashMap<String, String>,
+    uses: &HashSet<String>,
 ) -> bool {
     match r.level {
-        // L1 serves only its own project — the hot line.
-        Level::L1 => project.is_some() && r.project_id.as_deref() == project,
+        // L1 serves its own project — the hot line — plus, when the viewer
+        // explicitly uses that project, its hot lines too (serving from the
+        // viewer's warm tier; see `MemoryRecord::serving_level_for`).
+        Level::L1 => match (project, r.project_id.as_deref()) {
+            (Some(p), Some(rp)) => rp == p || uses.contains(rp),
+            _ => false,
+        },
         // L2 serves its own project *and* related scopes: same project's other
-        // components (same id), similar projects (explicit links), and — when
-        // the project has an L2 group — every other member of that group.
+        // components (same id), similar projects (explicit links), — when the
+        // project has an L2 group — every other member of that group, and the
+        // projects this one explicitly uses.
         Level::L2 => {
             // group-owned record ("all my CLIs use clap"): every member sees it
             if let Some(g) = effective_group(r.group.as_deref()) {
@@ -399,6 +409,7 @@ fn visible_at(
                 (Some(p), Some(rp)) => {
                     rp == p
                         || similar.contains(rp)
+                        || uses.contains(rp)
                         || my_group.is_some() && groups.get(rp).map(String::as_str) == my_group
                 }
                 _ => false,
@@ -726,6 +737,12 @@ impl MemoryEngine {
                 .get(&req.project_id)
                 .and_then(|p| p.group.clone())
         });
+        // re-registration never wipes user-managed `uses` links either
+        let uses = db
+            .projects
+            .get(&req.project_id)
+            .map(|p| p.uses.clone())
+            .unwrap_or_default();
         db.projects.insert(
             req.project_id.clone(),
             ProjectInfo {
@@ -736,6 +753,7 @@ impl MemoryEngine {
                 descriptor,
                 descriptor_vector: vector,
                 similar: Vec::new(),
+                uses,
                 group,
                 created_at_ms: now,
             },
@@ -785,6 +803,101 @@ impl MemoryEngine {
         Ok(info)
     }
 
+    /// Rename an L2 group everywhere at once: every project assigned to
+    /// `from` and every group-owned memory carrying it move to `to`. When
+    /// `to` is already an existing group this is a **merge** — the fix for
+    /// accidentally split families (`rustcli` vs `rust-clis`). Returns
+    /// (projects moved, group-owned memories moved).
+    pub fn rename_group(&self, user: &str, from: &str, to: &str) -> Result<(usize, usize)> {
+        if from == to {
+            return Err(MemoryError::invalid(
+                "from and to are the same group — nothing to rename",
+            ));
+        }
+        if !crate::store::valid_path_segment(to) || to == NO_GROUP {
+            return Err(MemoryError::invalid(format!(
+                "invalid group name `{to}` (use letters, digits, '-', '_', '.')"
+            )));
+        }
+        let dba = self.user_db(user)?;
+        let mut db = lock(&dba)?;
+        self.ensure_fingerprint(&db)?;
+        let mut projects = 0;
+        let mut records = 0;
+        for p in db.projects.values_mut() {
+            if p.group.as_deref() == Some(from) {
+                p.group = Some(to.to_string());
+                projects += 1;
+            }
+        }
+        for r in db.records.iter_mut() {
+            if r.group.as_deref() == Some(from) {
+                r.group = Some(to.to_string());
+                records += 1;
+            }
+        }
+        if projects == 0 && records == 0 {
+            return Err(MemoryError::invalid(format!(
+                "no project or memory belongs to group `{from}`"
+            )));
+        }
+        // the store reconciles the stale group's doc directory on save
+        self.store.save(user, &db)?;
+        Ok((projects, records))
+    }
+
+    /// Make `project_id` draw on `uses_id`: its L1 and L2 memories surface in
+    /// `project_id` (from the warm L2 tier). Directional — only the using
+    /// project gains visibility. Both projects must be registered; adding an
+    /// existing link is a no-op.
+    pub fn add_project_use(&self, user: &str, project_id: &str, uses_id: &str) -> Result<ProjectInfo> {
+        self.edit_project_use(user, project_id, uses_id, true)
+    }
+
+    /// Remove a `uses` link added by [`MemoryEngine::add_project_use`].
+    /// Removing a link that isn't there is a no-op.
+    pub fn remove_project_use(
+        &self,
+        user: &str,
+        project_id: &str,
+        uses_id: &str,
+    ) -> Result<ProjectInfo> {
+        self.edit_project_use(user, project_id, uses_id, false)
+    }
+
+    fn edit_project_use(
+        &self,
+        user: &str,
+        project_id: &str,
+        uses_id: &str,
+        add: bool,
+    ) -> Result<ProjectInfo> {
+        if uses_id == project_id {
+            return Err(MemoryError::invalid(
+                "a project cannot use itself — its own memories are already visible to it",
+            ));
+        }
+        let dba = self.user_db(user)?;
+        let mut db = lock(&dba)?;
+        self.ensure_fingerprint(&db)?;
+        for id in [project_id, uses_id] {
+            if !db.projects.contains_key(id) {
+                return Err(MemoryError::ProjectNotFound(id.to_string()));
+            }
+        }
+        let p = db.projects.get_mut(project_id).expect("checked above");
+        if add {
+            if !p.uses.iter().any(|s| s == uses_id) {
+                p.uses.push(uses_id.to_string());
+            }
+        } else {
+            p.uses.retain(|s| s != uses_id);
+        }
+        let info = p.clone();
+        self.store.save(user, &db)?;
+        Ok(info)
+    }
+
     /// Unregister a project: drop its registry entry, all of its records
     /// (every level), and any similarity links pointing at it. Returns the
     /// number of records removed. 404s when the project is unknown.
@@ -801,6 +914,7 @@ impl MemoryEngine {
         let removed = before - db.records.len();
         for p in db.projects.values_mut() {
             p.similar.retain(|s| s != project_id);
+            p.uses.retain(|s| s != project_id);
         }
         // the store reconciles the project's L1 folder and links file on save
         self.store.save(user, &db)?;
@@ -927,11 +1041,16 @@ impl MemoryEngine {
 
         let k = req.k.unwrap_or(self.config.default_k).clamp(1, 100);
         let project = req.project_id.clone();
-        let similar: HashSet<String> = project
+        let (similar, uses): (HashSet<String>, HashSet<String>) = match project
             .as_deref()
             .and_then(|p| db.projects.get(p))
-            .map(|pi| pi.similar.iter().cloned().collect())
-            .unwrap_or_default();
+        {
+            Some(pi) => (
+                pi.similar.iter().cloned().collect(),
+                pi.uses.iter().cloned().collect(),
+            ),
+            None => (HashSet::new(), HashSet::new()),
+        };
         let groups = effective_groups(&db);
         let my_group = project.as_deref().and_then(|p| groups.get(p).cloned());
         let min_sim = req
@@ -955,6 +1074,7 @@ impl MemoryEngine {
                 &similar,
                 my_group.as_deref(),
                 &groups,
+                &uses,
             ) {
                 continue;
             }
@@ -964,7 +1084,7 @@ impl MemoryEngine {
             }
             let score = recall_score(
                 sim,
-                r.level,
+                r.serving_level_for(project.as_deref()),
                 r.confidence,
                 now.saturating_sub(r.last_used_at_ms.max(r.created_at_ms)),
             );
@@ -1005,7 +1125,10 @@ impl MemoryEngine {
                     .iter()
                     .filter(|c| {
                         let r = &db.records[c.idx];
-                        r.level != Level::L1 && r.use_count >= self.config.promote_min_hits
+                        // borrowed L1 lines serve warm here, so they may
+                        // promote into this project's hot line like any L2 hit
+                        r.serving_level_for(Some(pid.as_str())) != Level::L1
+                            && r.use_count >= self.config.promote_min_hits
                     })
                     .map(|c| c.idx)
                     .collect();
@@ -1029,7 +1152,9 @@ impl MemoryEngine {
                     text: r.text.clone(),
                     similarity: c.sim,
                     score: c.score,
-                    level: r.level,
+                    // the tier it served from, not where it lives — a used
+                    // project's L1 lines surface here as warm (L2) hits
+                    level: r.serving_level_for(project.as_deref()),
                     kind: r.kind,
                     project_id: r.project_id.clone(),
                     params: r.params.clone(),
@@ -1066,10 +1191,15 @@ impl MemoryEngine {
         let now = (self.config.now)();
         let dba = self.user_db(user)?;
         let db = lock(&dba)?;
-        let similar: HashSet<String> = project_id
+        let (similar, uses): (HashSet<String>, HashSet<String>) = match project_id
             .and_then(|p| db.projects.get(p))
-            .map(|pi| pi.similar.iter().cloned().collect())
-            .unwrap_or_default();
+        {
+            Some(pi) => (
+                pi.similar.iter().cloned().collect(),
+                pi.uses.iter().cloned().collect(),
+            ),
+            None => (HashSet::new(), HashSet::new()),
+        };
         let groups = effective_groups(&db);
         let my_group = project_id.and_then(|p| groups.get(p).cloned());
         let visible: Vec<&MemoryRecord> = db
@@ -1077,11 +1207,19 @@ impl MemoryEngine {
             .iter()
             .filter(|r| {
                 !r.is_expired(now)
-                    && visible_at(r, project_id, &similar, my_group.as_deref(), &groups)
+                    && visible_at(
+                        r,
+                        project_id,
+                        &similar,
+                        my_group.as_deref(),
+                        &groups,
+                        &uses,
+                    )
             })
             .collect();
         Ok(params::collect_suggestions(
             &visible,
+            project_id,
             now,
             self.config.half_life_days,
             self.config.numeric_param_tolerance,
@@ -1117,19 +1255,37 @@ impl MemoryEngine {
         let now = (self.config.now)();
         let dba = self.user_db(user)?;
         let db = lock(&dba)?;
-        let similar: HashSet<String> = project_id
+        let (similar, uses): (HashSet<String>, HashSet<String>) = match project_id
             .and_then(|p| db.projects.get(p))
-            .map(|pi| pi.similar.iter().cloned().collect())
-            .unwrap_or_default();
+        {
+            Some(pi) => (
+                pi.similar.iter().cloned().collect(),
+                pi.uses.iter().cloned().collect(),
+            ),
+            None => (HashSet::new(), HashSet::new()),
+        };
         let groups = effective_groups(&db);
         let my_group = project_id.and_then(|p| groups.get(p).cloned());
         let visible = |r: &MemoryRecord| {
-            !r.is_expired(now) && visible_at(r, project_id, &similar, my_group.as_deref(), &groups)
+            !r.is_expired(now)
+                && visible_at(
+                    r,
+                    project_id,
+                    &similar,
+                    my_group.as_deref(),
+                    &groups,
+                    &uses,
+                )
         };
 
+        // bucket by the layer each record *serves at* for this project — a
+        // used project's L1 lines are warm context here, not our hot lines
         let mut by_layer: BTreeMap<Level, Vec<MemoryLine>> = BTreeMap::new();
         for r in db.records.iter().filter(|r| visible(r)) {
-            by_layer.entry(r.level).or_default().push(MemoryLine {
+            by_layer
+                .entry(r.serving_level_for(project_id))
+                .or_default()
+                .push(MemoryLine {
                 id: r.id.clone(),
                 text: r.text.clone(),
                 params: r.params.clone(),
@@ -1158,6 +1314,7 @@ impl MemoryEngine {
             l3: by_layer.remove(&Level::L3).unwrap_or_default(),
             params: params::collect_suggestions(
                 &db.records.iter().filter(|r| visible(r)).collect::<Vec<_>>(),
+                project_id,
                 now,
                 self.config.half_life_days,
                 self.config.numeric_param_tolerance,
