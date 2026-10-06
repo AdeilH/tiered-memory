@@ -215,7 +215,7 @@ of a mutation (embedding happens outside), and saves after each mutation.
   cache/
     uses.txt                         project → project memory sources (hand-editable)
     L1/<project-id>/memories.json    records at L1 of that project (machine)
-    L1/<project-id>/memories.md      regenerated human-readable mirror
+    L1/<project-id>/memories.md      human-readable mirror (rebuilt on content change)
     L2/memories.json                 all L2 records (flat machine store)
     L2/groups/<g>/<topic>.md         human docs per group + topic
     L2/ungrouped/<topic>.md          …for projects without a group

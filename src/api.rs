@@ -351,11 +351,7 @@ async fn set_uses(
             })
         }
     };
-    let (user, project, target) = (
-        req.user.clone(),
-        req.project_id.clone(),
-        target.to_string(),
-    );
+    let (user, project, target) = (req.user.clone(), req.project_id.clone(), target.to_string());
     let (u2, p2, t2) = (user.clone(), project.clone(), target.clone());
     let info = blocking(&state, move |e| {
         if adding {

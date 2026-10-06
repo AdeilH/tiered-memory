@@ -46,6 +46,40 @@ descriptor; `--name`, `--id`, `--descriptor` override detection. `init` prints
 the full paths (marker + data dir) and asks to add `tiered-memory.json` to
 `.gitignore` (Enter = yes; `--gitignore` pre-answers in scripts).
 
+## Backend + frontend in one warm tier (L2)
+
+A product with a backend repo and a frontend repo should share its *warm*
+knowledge — API contracts, naming conventions, auth flow — while keeping each
+repo's hot line (L1) its own. That is exactly the L2 group mechanism, and
+`init` sets it up directly:
+
+```bash
+cd myapp-backend/    # tiered-memory init --component backend --group myapp
+cd ../myapp-frontend # tiered-memory init --component frontend --group myapp
+```
+
+After this:
+
+- **Project-owned L2 memories flow both ways.** A fact learned in the backend
+  (`--level L2`, e.g. "API returns camelCase JSON") surfaces when recalling in
+  the frontend, and vice versa. L1 stays per-repo: hot lines are not shared.
+- **Group-owned records** (`tiered-memory remember "..." --group myapp --topic contracts`)
+  belong to the product, not either repo — visible from both, owned by neither.
+- **`--component`/`--tag`** (repeatable) feed the descriptor, so the automatic
+  similar-project linking gets a strong signal on top of the deterministic
+  group link. They are metadata for matching and display; the group is what
+  guarantees the sharing.
+- The session brief (hook + `/tiered-memory` skill) shows `L2 group: myapp`
+  and its member projects, so the agent knows the sibling repo exists and
+  files product-wide facts with `--group`.
+
+Want the hot lines to bleed across too? `tiered-memory use <sibling>` adds a
+directional borrow: the other repo's L1 memories surface here *at the warm
+tier*, and heavily-used ones promote into this repo's L1 like any L2 hit.
+
+One project id for both repos also works (`init --id myapp` in each) — then
+L1 is shared too, which is only right if you treat the two repos as one codebase.
+
 ## Running the service
 
 ```bash

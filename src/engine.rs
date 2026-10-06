@@ -26,7 +26,7 @@ use crate::error::{MemoryError, Result};
 use crate::params::{self, ParamSuggestion};
 use crate::store::MemoryStore;
 use crate::types::{Level, MemoryKind, MemoryRecord, ParamValue, ProjectInfo, UserDb, DAY_MS};
-use crate::vector::{cosine, gen_id};
+use crate::vector::{dot, gen_id};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -380,43 +380,72 @@ pub struct MemoryEngine {
 /// project's explicit similarity links; `my_group` its L2 group; `groups`
 /// maps every project id to its group (effective — `none` already removed);
 /// `uses` the projects this one explicitly draws memory from.
-fn visible_at(
-    r: &MemoryRecord,
-    project: Option<&str>,
-    similar: &HashSet<String>,
-    my_group: Option<&str>,
-    groups: &HashMap<String, String>,
-    uses: &HashSet<String>,
-) -> bool {
-    match r.level {
-        // L1 serves its own project — the hot line — plus, when the viewer
-        // explicitly uses that project, its hot lines too (serving from the
-        // viewer's warm tier; see `MemoryRecord::serving_level_for`).
-        Level::L1 => match (project, r.project_id.as_deref()) {
-            (Some(p), Some(rp)) => rp == p || uses.contains(rp),
-            _ => false,
-        },
-        // L2 serves its own project *and* related scopes: same project's other
-        // components (same id), similar projects (explicit links), — when the
-        // project has an L2 group — every other member of that group, and the
-        // projects this one explicitly uses.
-        Level::L2 => {
-            // group-owned record ("all my CLIs use clap"): every member sees it
-            if let Some(g) = effective_group(r.group.as_deref()) {
-                return my_group == Some(g);
-            }
-            match (project, r.project_id.as_deref()) {
-                (Some(p), Some(rp)) => {
-                    rp == p
-                        || similar.contains(rp)
-                        || uses.contains(rp)
-                        || my_group.is_some() && groups.get(rp).map(String::as_str) == my_group
-                }
-                _ => false,
-            }
+/// Which records a viewer in one project scope may see — the L2 federation
+/// rules in a single place. Every serving path (`recall`, `memory_context`,
+/// `adjusted_parameters`) builds one of these first and gates records through
+/// [`Visibility::allows`]; nothing reads the record set directly.
+struct Visibility {
+    project: Option<String>,
+    similar: HashSet<String>,
+    uses: HashSet<String>,
+    groups: HashMap<String, String>,
+    my_group: Option<String>,
+}
+
+impl Visibility {
+    /// Resolve the viewer's relationship sets: the precomputed `similar` and
+    /// `uses` links, the group registry, and the project's own group.
+    fn for_project(db: &UserDb, project: Option<&str>) -> Self {
+        let (similar, uses) = match project.and_then(|p| db.projects.get(p)) {
+            Some(pi) => (
+                pi.similar.iter().cloned().collect(),
+                pi.uses.iter().cloned().collect(),
+            ),
+            None => (HashSet::new(), HashSet::new()),
+        };
+        let groups = effective_groups(db);
+        Visibility {
+            project: project.map(str::to_string),
+            similar,
+            uses,
+            my_group: project.and_then(|p| groups.get(p).cloned()),
+            groups,
         }
-        // L3 is global.
-        Level::L3 => true,
+    }
+
+    fn allows(&self, r: &MemoryRecord) -> bool {
+        let project = self.project.as_deref();
+        match r.level {
+            // L1 serves its own project — the hot line — plus, when the viewer
+            // explicitly uses that project, its hot lines too (serving from the
+            // viewer's warm tier; see `MemoryRecord::serving_level_for`).
+            Level::L1 => match (project, r.project_id.as_deref()) {
+                (Some(p), Some(rp)) => rp == p || self.uses.contains(rp),
+                _ => false,
+            },
+            // L2 serves its own project *and* related scopes: same project's
+            // other components (same id), similar projects (descriptor links),
+            // — when the project has an L2 group — every other member of that
+            // group, and the projects this one explicitly uses.
+            Level::L2 => {
+                // group-owned record ("all my CLIs use clap"): every member of
+                // that one group sees it; nobody else does
+                if let Some(g) = effective_group(r.group.as_deref()) {
+                    return self.my_group.as_deref() == Some(g);
+                }
+                match (project, r.project_id.as_deref()) {
+                    (Some(p), Some(rp)) => {
+                        rp == p
+                            || self.similar.contains(rp)
+                            || self.uses.contains(rp)
+                            || self.groups.get(rp).map(String::as_str) == self.my_group.as_deref()
+                    }
+                    _ => false,
+                }
+            }
+            // L3 is global.
+            Level::L3 => true,
+        }
     }
 }
 
@@ -467,6 +496,12 @@ impl MemoryEngine {
         gen_id("m", text, now_ms, c)
     }
 
+    /// Embed a single text — the shape every engine path uses.
+    fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        let mut out = self.embedder.embed(&[text.to_string()])?;
+        Ok(out.pop().expect("one embed per text"))
+    }
+
     fn user_db(&self, user: &str) -> Result<Arc<Mutex<UserDb>>> {
         if let Some(db) = self.users.read().expect("users lock").get(user) {
             return Ok(db.clone());
@@ -498,25 +533,34 @@ impl MemoryEngine {
 
     /// Keep a layer within capacity. L1 evictees that are canonical memories
     /// (not promoted copies) are demoted into L2 — write-back, nothing is lost.
+    /// Victims are picked in one pass: the `cap`-overflow lowest-value unpinned
+    /// lines, ties keeping the earliest record (matching a linear scan).
     fn enforce_capacity(&self, db: &mut UserDb, level: Level, now_ms: u64) -> usize {
         let cap = level.capacity_in(&self.config);
+        let in_level = db.records.iter().filter(|r| r.level == level).count();
+        let overflow = in_level.saturating_sub(cap);
+        if overflow == 0 {
+            return 0;
+        }
+        let mut victims: Vec<(f32, usize)> = db
+            .records
+            .iter()
+            .enumerate()
+            .filter(|&(_, r)| r.level == level && !r.pinned)
+            .map(|(i, r)| (eviction_value(r, now_ms), i))
+            .collect();
+        if victims.len() > overflow {
+            victims.select_nth_unstable_by(overflow, |a, b| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.1.cmp(&b.1))
+            });
+            victims.truncate(overflow);
+        }
+        // remove back-to-front so earlier indices stay valid while deleting
+        victims.sort_unstable_by_key(|&(_, i)| std::cmp::Reverse(i));
         let mut demoted = 0;
-        loop {
-            let count = db.records.iter().filter(|r| r.level == level).count();
-            if count <= cap {
-                break;
-            }
-            let mut best: Option<(usize, f32)> = None;
-            for (i, r) in db.records.iter().enumerate() {
-                if r.level != level || r.pinned {
-                    continue;
-                }
-                let v = eviction_value(r, now_ms);
-                if best.map(|(_, bv)| v < bv).unwrap_or(true) {
-                    best = Some((i, v));
-                }
-            }
-            let Some((i, _)) = best else { break }; // all pinned → allow overflow
+        for (_, i) in victims {
             let rec = db.records.remove(i);
             if level == Level::L1 && rec.origin.is_none() {
                 demoted += 1;
@@ -525,8 +569,9 @@ impl MemoryEngine {
                     ..rec
                 });
             }
-            // promoted copies & L2/L3 overflow simply drop
         }
+        // promoted copies & L2/L3 overflow simply drop; fewer unpinned lines
+        // than the overflow allows means the layer is all-pinned → allow it
         demoted
     }
 
@@ -604,30 +649,23 @@ impl MemoryEngine {
                     && r.project_id.as_deref() == project_id
                     && r.key_hint.as_deref() == Some(kh.as_str())
             }) {
-                rec.text = inc.text.clone();
-                rec.vector = inc.vector.clone();
-                for (k, v) in inc.params.clone() {
-                    rec.params.insert(k, v);
-                }
+                // repeated assertions average out; a TTL/pin re-asserted wins
                 rec.confidence = (rec.confidence + inc.confidence) / 2.0;
-                rec.last_used_at_ms = inc.now;
                 rec.expires_at_ms = inc.expires_at_ms;
-                rec.use_count += 1;
-                if inc.topic.is_some() {
-                    rec.topic = inc.topic.clone();
-                }
                 if let Some(p) = inc.pinned {
                     rec.pinned = p;
                 }
+                fold_record(rec, inc);
                 return Some(rec.id.clone());
             }
         }
 
         // 2) near-duplicate content at the same scope merges in place
+        // (vectors are normalized — dot is the cosine)
         let mut best: Option<(usize, f32)> = None;
         for (i, r) in db.records.iter().enumerate() {
             if r.level == level && r.project_id.as_deref() == project_id && !r.vector.is_empty() {
-                let sim = cosine(&inc.vector, &r.vector);
+                let sim = dot(&inc.vector, &r.vector);
                 if sim > dup_threshold && best.map(|(_, s)| sim > s).unwrap_or(true) {
                     best = Some((i, sim));
                 }
@@ -635,21 +673,14 @@ impl MemoryEngine {
         }
         let i = best?.0;
         let rec = &mut db.records[i];
-        rec.text = inc.text.clone();
-        rec.vector = inc.vector.clone();
-        for (k, v) in inc.params.clone() {
-            rec.params.insert(k, v);
-        }
+        // independent evidence compounds (noisy-OR), capped just under certain
         rec.confidence = (1.0 - (1.0 - rec.confidence) * (1.0 - inc.confidence)).min(0.99);
-        rec.last_used_at_ms = inc.now;
-        rec.use_count += 1;
-        if inc.topic.is_some() {
-            rec.topic = inc.topic.clone();
-        }
+        fold_record(rec, inc);
         Some(rec.id.clone())
     }
 
     /// Write-path step 3: allocate a fresh cache line for the payload.
+    #[allow(clippy::too_many_arguments)]
     fn allocate_line(
         &self,
         db: &mut UserDb,
@@ -706,12 +737,7 @@ impl MemoryEngine {
                 "project needs a descriptor (name, tags, components or explicit descriptor text)",
             ));
         }
-        let vector = self
-            .embedder
-            .embed(std::slice::from_ref(&descriptor))?
-            .into_iter()
-            .next()
-            .expect("one embed");
+        let vector = self.embed_one(&descriptor)?;
         ensure_embedded(&vector, &format!("project descriptor `{descriptor}`"))?;
 
         let dba = self.user_db(&req.user)?;
@@ -850,7 +876,12 @@ impl MemoryEngine {
     /// `project_id` (from the warm L2 tier). Directional — only the using
     /// project gains visibility. Both projects must be registered; adding an
     /// existing link is a no-op.
-    pub fn add_project_use(&self, user: &str, project_id: &str, uses_id: &str) -> Result<ProjectInfo> {
+    pub fn add_project_use(
+        &self,
+        user: &str,
+        project_id: &str,
+        uses_id: &str,
+    ) -> Result<ProjectInfo> {
         self.edit_project_use(user, project_id, uses_id, true)
     }
 
@@ -935,7 +966,12 @@ impl MemoryEngine {
                 MemoryKind::Preference
             }
         });
-        let (level, project_id, group, topic) = resolve_placement(&req, kind)?;
+        let Placement {
+            level,
+            project_id,
+            group,
+            topic,
+        } = resolve_placement(&req, kind)?;
         let mut incoming = Incoming::new(
             text,
             req.params.unwrap_or_default(),
@@ -947,12 +983,7 @@ impl MemoryEngine {
             (self.config.now)(),
         )?;
         // embed before locking: this may be a slow HTTP call
-        incoming.vector = self
-            .embedder
-            .embed(std::slice::from_ref(&incoming.text))?
-            .into_iter()
-            .next()
-            .expect("one embed");
+        incoming.vector = self.embed_one(&incoming.text)?;
         ensure_embedded(&incoming.vector, &format!("memory `{}`", incoming.text))?;
         let now = incoming.now;
 
@@ -1028,12 +1059,7 @@ impl MemoryEngine {
             return Err(MemoryError::invalid("query must not be empty"));
         }
         let now = (self.config.now)();
-        let qvec = self
-            .embedder
-            .embed(std::slice::from_ref(&query))?
-            .into_iter()
-            .next()
-            .expect("one embed");
+        let qvec = self.embed_one(&query)?;
 
         let dba = self.user_db(&req.user)?;
         let mut db = lock(&dba)?;
@@ -1041,18 +1067,7 @@ impl MemoryEngine {
 
         let k = req.k.unwrap_or(self.config.default_k).clamp(1, 100);
         let project = req.project_id.clone();
-        let (similar, uses): (HashSet<String>, HashSet<String>) = match project
-            .as_deref()
-            .and_then(|p| db.projects.get(p))
-        {
-            Some(pi) => (
-                pi.similar.iter().cloned().collect(),
-                pi.uses.iter().cloned().collect(),
-            ),
-            None => (HashSet::new(), HashSet::new()),
-        };
-        let groups = effective_groups(&db);
-        let my_group = project.as_deref().and_then(|p| groups.get(p).cloned());
+        let vis = Visibility::for_project(&db, project.as_deref());
         let min_sim = req
             .min_similarity
             .or(self.config.default_min_similarity)
@@ -1068,17 +1083,12 @@ impl MemoryEngine {
             if r.is_expired(now) || r.vector.is_empty() {
                 continue;
             }
-            if !visible_at(
-                r,
-                project.as_deref(),
-                &similar,
-                my_group.as_deref(),
-                &groups,
-                &uses,
-            ) {
+            if !vis.allows(r) {
                 continue;
             }
-            let sim = cosine(&qvec, &r.vector);
+            // stored + query vectors are L2-normalized (embedder contract) —
+            // the dot product is the cosine, without two norm passes per record
+            let sim = dot(&qvec, &r.vector);
             if sim < min_sim {
                 continue;
             }
@@ -1173,7 +1183,10 @@ impl MemoryEngine {
         }
         searched.push(Level::L3);
 
-        self.store.save(&req.user, &db)?;
+        // a recall that served nothing touched nothing — skip the disk rewrite
+        if !chosen.is_empty() || !promoted.is_empty() {
+            self.store.save(&req.user, &db)?;
+        }
         Ok(RecallOutput {
             hits,
             searched,
@@ -1191,31 +1204,11 @@ impl MemoryEngine {
         let now = (self.config.now)();
         let dba = self.user_db(user)?;
         let db = lock(&dba)?;
-        let (similar, uses): (HashSet<String>, HashSet<String>) = match project_id
-            .and_then(|p| db.projects.get(p))
-        {
-            Some(pi) => (
-                pi.similar.iter().cloned().collect(),
-                pi.uses.iter().cloned().collect(),
-            ),
-            None => (HashSet::new(), HashSet::new()),
-        };
-        let groups = effective_groups(&db);
-        let my_group = project_id.and_then(|p| groups.get(p).cloned());
+        let vis = Visibility::for_project(&db, project_id);
         let visible: Vec<&MemoryRecord> = db
             .records
             .iter()
-            .filter(|r| {
-                !r.is_expired(now)
-                    && visible_at(
-                        r,
-                        project_id,
-                        &similar,
-                        my_group.as_deref(),
-                        &groups,
-                        &uses,
-                    )
-            })
+            .filter(|r| !r.is_expired(now) && vis.allows(r))
             .collect();
         Ok(params::collect_suggestions(
             &visible,
@@ -1255,28 +1248,8 @@ impl MemoryEngine {
         let now = (self.config.now)();
         let dba = self.user_db(user)?;
         let db = lock(&dba)?;
-        let (similar, uses): (HashSet<String>, HashSet<String>) = match project_id
-            .and_then(|p| db.projects.get(p))
-        {
-            Some(pi) => (
-                pi.similar.iter().cloned().collect(),
-                pi.uses.iter().cloned().collect(),
-            ),
-            None => (HashSet::new(), HashSet::new()),
-        };
-        let groups = effective_groups(&db);
-        let my_group = project_id.and_then(|p| groups.get(p).cloned());
-        let visible = |r: &MemoryRecord| {
-            !r.is_expired(now)
-                && visible_at(
-                    r,
-                    project_id,
-                    &similar,
-                    my_group.as_deref(),
-                    &groups,
-                    &uses,
-                )
-        };
+        let vis = Visibility::for_project(&db, project_id);
+        let visible = |r: &MemoryRecord| !r.is_expired(now) && vis.allows(r);
 
         // bucket by the layer each record *serves at* for this project — a
         // used project's L1 lines are warm context here, not our hot lines
@@ -1286,23 +1259,23 @@ impl MemoryEngine {
                 .entry(r.serving_level_for(project_id))
                 .or_default()
                 .push(MemoryLine {
-                id: r.id.clone(),
-                text: r.text.clone(),
-                params: r.params.clone(),
-                key_hint: r.key_hint.clone(),
-                confidence: r.confidence,
-                pinned: r.pinned,
-            });
+                    id: r.id.clone(),
+                    text: r.text.clone(),
+                    params: r.params.clone(),
+                    key_hint: r.key_hint.clone(),
+                    confidence: r.confidence,
+                    pinned: r.pinned,
+                });
         }
         for lines in by_layer.values_mut() {
             lines.truncate(per_layer_cap.max(1));
         }
-        let group_members = match (project_id, my_group.clone()) {
+        let group_members = match (project_id, vis.my_group.clone()) {
             (Some(p), Some(g)) => db
                 .projects
                 .iter()
                 .filter(|(id, _)| {
-                    id.as_str() != p && groups.get(*id).map(String::as_str) == Some(g.as_str())
+                    id.as_str() != p && vis.groups.get(*id).map(String::as_str) == Some(g.as_str())
                 })
                 .map(|(id, _)| id.clone())
                 .collect(),
@@ -1319,7 +1292,7 @@ impl MemoryEngine {
                 self.config.half_life_days,
                 self.config.numeric_param_tolerance,
             ),
-            group: my_group,
+            group: vis.my_group.clone(),
             group_members,
         })
     }
@@ -1344,50 +1317,62 @@ impl MemoryEngine {
             .retain(|r| r.pinned || r.confidence >= self.config.confidence_floor);
         report.forgotten = before - db.records.len();
 
-        // 3) merge near-duplicates within the same (level, scope)
-        let len = db.records.len();
-        let mut removed = vec![false; len];
-        for i in 0..len {
-            if removed[i] {
-                continue;
-            }
-            for j in (i + 1)..len {
-                if removed[j] || removed[i] {
+        // 3) merge near-duplicates within the same (level, scope). Records are
+        // bucketed by scope first so the pairwise similarity pass (dot —
+        // vectors are normalized) only runs inside a bucket, never across the
+        // whole store.
+        let mut removed = vec![false; db.records.len()];
+        let mut buckets: HashMap<(Level, Option<String>, Option<String>), Vec<usize>> =
+            HashMap::new();
+        for (idx, r) in db.records.iter().enumerate() {
+            buckets
+                .entry((r.level, r.project_id.clone(), r.group.clone()))
+                .or_default()
+                .push(idx);
+        }
+        for idxs in buckets.values() {
+            // buckets keep ascending record order, so pair iteration matches
+            // a whole-store scan of the same records
+            for pos in 0..idxs.len() {
+                let i = idxs[pos];
+                if removed[i] {
                     continue;
                 }
-                let key_conflict = db.records[i].key_hint.is_some()
-                    && db.records[j].key_hint.is_some()
-                    && db.records[i].key_hint != db.records[j].key_hint;
-                if key_conflict
-                    || db.records[i].level != db.records[j].level
-                    || db.records[i].project_id != db.records[j].project_id
-                {
-                    continue;
+                for &j in &idxs[pos + 1..] {
+                    if removed[j] || removed[i] {
+                        continue;
+                    }
+                    let key_conflict = db.records[i].key_hint.is_some()
+                        && db.records[j].key_hint.is_some()
+                        && db.records[i].key_hint != db.records[j].key_hint;
+                    if key_conflict {
+                        continue;
+                    }
+                    let sim = dot(&db.records[i].vector, &db.records[j].vector);
+                    if sim <= self.config.merge_threshold {
+                        continue;
+                    }
+                    let (k, d) = if db.records[i].created_at_ms >= db.records[j].created_at_ms {
+                        (i, j)
+                    } else {
+                        (j, i)
+                    };
+                    let conf = (1.0
+                        - (1.0 - db.records[k].confidence) * (1.0 - db.records[d].confidence))
+                        .min(0.99);
+                    let extra = db.records[d].params.clone();
+                    let used = db.records[d].use_count;
+                    let last_used = db.records[d].last_used_at_ms;
+                    let kr = &mut db.records[k];
+                    kr.confidence = conf;
+                    for (kk, vv) in extra {
+                        kr.params.entry(kk).or_insert(vv);
+                    }
+                    kr.use_count += used;
+                    kr.last_used_at_ms = kr.last_used_at_ms.max(last_used);
+                    removed[d] = true;
+                    report.merged += 1;
                 }
-                let sim = cosine(&db.records[i].vector, &db.records[j].vector);
-                if sim <= self.config.merge_threshold {
-                    continue;
-                }
-                let (k, d) = if db.records[i].created_at_ms >= db.records[j].created_at_ms {
-                    (i, j)
-                } else {
-                    (j, i)
-                };
-                let conf = (1.0
-                    - (1.0 - db.records[k].confidence) * (1.0 - db.records[d].confidence))
-                    .min(0.99);
-                let extra = db.records[d].params.clone();
-                let used = db.records[d].use_count;
-                let last_used = db.records[d].last_used_at_ms;
-                let kr = &mut db.records[k];
-                kr.confidence = conf;
-                for (kk, vv) in extra {
-                    kr.params.entry(kk).or_insert(vv);
-                }
-                kr.use_count += used;
-                kr.last_used_at_ms = kr.last_used_at_ms.max(last_used);
-                removed[d] = true;
-                report.merged += 1;
             }
         }
         if report.merged > 0 {
@@ -1478,12 +1463,7 @@ impl MemoryEngine {
             key,
             consensus.as_text()
         );
-        let vector = self
-            .embedder
-            .embed(std::slice::from_ref(&text))?
-            .into_iter()
-            .next()
-            .expect("one embed");
+        let vector = self.embed_one(&text)?;
         ensure_embedded(&vector, &format!("lifted trait for `{key}`"))?;
         let existing = db
             .records
@@ -1640,6 +1620,15 @@ fn effective_groups(db: &UserDb) -> HashMap<String, String> {
         .collect()
 }
 
+/// Where a [`RememberInput`] lands: the layer, the owning project scope, an
+/// L2 group owner, and the normalized topic slug for the L2 docs.
+struct Placement {
+    level: Level,
+    project_id: Option<String>,
+    group: Option<String>,
+    topic: Option<String>,
+}
+
 /// Resolve the write placement from a request: the explicit level (or the
 /// automatic routing), group ownership, the project scope, and the normalized
 /// topic slug. All placement errors are raised here so `remember` stays a
@@ -1652,10 +1641,7 @@ fn effective_groups(db: &UserDb) -> HashMap<String, String> {
 /// memories surface to, no rewrite needed. For the same reason a group-owned
 /// record never carries a project: its home is the group, and regrouping a
 /// project must not drag group-level facts along.
-fn resolve_placement(
-    req: &RememberInput,
-    kind: MemoryKind,
-) -> Result<(Level, Option<String>, Option<String>, Option<String>)> {
+fn resolve_placement(req: &RememberInput, kind: MemoryKind) -> Result<Placement> {
     let level = req.level.unwrap_or({
         if kind == MemoryKind::Trait || req.project_id.is_none() {
             Level::L3
@@ -1697,7 +1683,12 @@ fn resolve_placement(
         ));
     }
     let topic = req.topic.as_deref().and_then(crate::store::normalize_topic);
-    Ok((level, project_id, group, topic))
+    Ok(Placement {
+        level,
+        project_id,
+        group,
+        topic,
+    })
 }
 
 /// The validated payload of a [`MemoryEngine::remember`] call — everything
@@ -1716,6 +1707,23 @@ struct Incoming {
     pinned: Option<bool>,
     topic: Option<String>,
     now: u64,
+}
+
+/// Shared tail of both upsert paths: replace text/vector with the newest
+/// wording, merge asserted params over the old ones, refresh recency/usage,
+/// and let a re-asserted topic win. Confidence, expiry and pinning policy
+/// differ between the two paths and stay in the caller.
+fn fold_record(rec: &mut MemoryRecord, inc: &Incoming) {
+    rec.text = inc.text.clone();
+    rec.vector = inc.vector.clone();
+    for (k, v) in &inc.params {
+        rec.params.insert(k.clone(), v.clone());
+    }
+    rec.last_used_at_ms = inc.now;
+    rec.use_count += 1;
+    if inc.topic.is_some() {
+        rec.topic = inc.topic.clone();
+    }
 }
 
 impl Incoming {
@@ -1765,7 +1773,7 @@ fn recompute_similar(db: &mut UserDb, threshold: f32) {
                 &db.projects[a.as_str()].descriptor_vector,
                 &db.projects[b.as_str()].descriptor_vector,
             );
-            if !va.is_empty() && !vb.is_empty() && cosine(va, vb) >= threshold {
+            if !va.is_empty() && !vb.is_empty() && dot(va, vb) >= threshold {
                 let pa = &mut db.projects.get_mut(a).expect("exists");
                 if !pa.similar.contains(b) {
                     pa.similar.push(b.clone());

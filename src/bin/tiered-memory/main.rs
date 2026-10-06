@@ -92,12 +92,15 @@ fn print_usage() {
 USAGE:
   tiered-memory serve                    start the HTTP service on {DEFAULT_BIND}
   tiered-memory setup | init [--name N] [--id ID] [--descriptor T]
+                                         [--tag T]... [--component C]...
                                          [--group NAME|none] [--user U] [--gitignore]
                                          set THIS directory up as a project:
                                          register, ask its L2 group, offer LLM
                                          credentials and the /tiered-memory skill
                                          for your harness(es) (scripts: --group and
-                                         --gitignore pre-answers the prompts)
+                                         --gitignore pre-answers the prompts;
+                                         --tag/--component are repeatable and feed
+                                         similar-project matching)
   tiered-memory projects [--user U]      list projects using tiered memory
   tiered-memory projects remove <id>     unregister a project + forget its records
   tiered-memory select  [--user U] [--project P]
@@ -256,6 +259,14 @@ pub(crate) fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// Every value of a repeatable `--flag <value>` (`--tag a --tag b` → `[a, b]`).
+pub(crate) fn arg_values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == flag)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
 /// Boolean switch `--flag`.
 pub(crate) fn arg_switch(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
@@ -276,6 +287,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--level",
     "--group",
     "--topic",
+    "--tag",
+    "--component",
 ];
 
 fn takes_value(flag: &str) -> bool {

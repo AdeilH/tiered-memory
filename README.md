@@ -278,7 +278,7 @@ unless `TM_ALLOW_INSECURE=1`.
 ## Where your data lives
 
 The directory tree *is* the cache — JSON is authoritative, `.md` files are
-human-readable mirrors regenerated on every write:
+human-readable mirrors regenerated whenever the layer's content changes:
 
 ```text
 ~/tiered-memory/

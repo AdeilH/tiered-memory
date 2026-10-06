@@ -93,9 +93,7 @@ pub(crate) fn width() -> u16 {
 
 /// Terminal height in rows.
 pub(crate) fn height() -> u16 {
-    crossterm::terminal::size()
-        .map(|(_, h)| h)
-        .unwrap_or(24)
+    crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24)
 }
 
 pub(crate) fn trunc(s: &str, max: u16) -> String {
@@ -524,26 +522,24 @@ pub fn run_credentials_wizard(cfg: &mut crate::llm::LlmConfig) -> Result<bool> {
             if !event_available()? {
                 continue;
             }
-            match read()? {
-                Event::Key(KeyEvent {
-                    code,
-                    kind: KeyEventKind::Press,
-                    modifiers,
-                    ..
-                }) => {
-                    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
-                        return Ok(false);
-                    }
-                    match code {
-                        KeyCode::Enter => {
-                            *cfg = proposed;
-                            return Ok(true);
-                        }
-                        KeyCode::Esc => return Ok(false),
-                        _ => {}
-                    }
+            if let Event::Key(KeyEvent {
+                code,
+                kind: KeyEventKind::Press,
+                modifiers,
+                ..
+            }) = read()?
+            {
+                if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+                    return Ok(false);
                 }
-                _ => {}
+                match code {
+                    KeyCode::Enter => {
+                        *cfg = proposed;
+                        return Ok(true);
+                    }
+                    KeyCode::Esc => return Ok(false),
+                    _ => {}
+                }
             }
         }
     }

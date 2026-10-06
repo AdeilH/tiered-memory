@@ -239,11 +239,8 @@ fn fetch_from_hub(repo_id: &str, cache_dir: Option<&Path>) -> Result<ModelFiles>
     // many first runs — the error must say what failed and how to avoid it
     let hint = "first run fetches the model from the HF hub; for offline use set TM_MODEL_DIR to a local copy or TM_EMBEDDER=hashing";
     let get = |name: &str| -> Result<PathBuf> {
-        repo.get(name).map_err(|e| {
-            MemoryError::Embedder(format!(
-                "download {repo_id}/{name}: {e} — {hint}"
-            ))
-        })
+        repo.get(name)
+            .map_err(|e| MemoryError::Embedder(format!("download {repo_id}/{name}: {e} — {hint}")))
     };
     Ok(ModelFiles {
         config: get("config.json")?,

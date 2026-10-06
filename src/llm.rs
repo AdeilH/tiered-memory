@@ -202,10 +202,7 @@ pub fn mask_key(key: &str) -> String {
 /// (`GET {base_url}/models`). Used by the credentials wizard's searchable
 /// model picker and the `tiered-memory models` command.
 pub fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
-    let url = format!(
-        "{}/models",
-        base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut req = ureq::get(&url)
         .config()
         .timeout_global(Some(std::time::Duration::from_secs(15)))

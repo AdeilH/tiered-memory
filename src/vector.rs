@@ -1,12 +1,17 @@
 //! Small vector helpers: similarity, normalization, id generation.
 
 /// Dot product of two equal-length slices.
+///
+/// Every [`crate::embed::Embedder`] returns L2-normalized vectors (trait
+/// contract), so for stored/query vectors this *is* the cosine similarity —
+/// without recomputing either norm. Hot scans (recall, dedupe, consolidation)
+/// therefore use `dot` directly; `cosine` remains for untrusted inputs.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Cosine similarity with a guard for zero vectors. Embeddings this engine
-/// stores are already L2-normalized, so this is effectively a dot product.
+/// Cosine similarity with a guard for zero vectors. For the engine's own
+/// L2-normalized embeddings this equals [`dot`]; prefer `dot` in hot loops.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let na = (a.iter().map(|x| x * x).sum::<f32>()).sqrt();
     let nb = (b.iter().map(|x| x * x).sum::<f32>()).sqrt();
@@ -17,7 +22,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Normalize a vector in place to unit length.
-pub fn normalize(v: &mut Vec<f32>) {
+pub fn normalize(v: &mut [f32]) {
     let n = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
     if n > 1e-12 {
         for x in v.iter_mut() {

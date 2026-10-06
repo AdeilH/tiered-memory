@@ -5,8 +5,8 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 use crate::{
-    api_base, arg_switch, arg_value, cmd_args, data_root, default_user, flags, home_dir,
-    local_engine, positional, resolve_project, service_or_local, store,
+    api_base, arg_switch, arg_value, arg_values, cmd_args, data_root, default_user, flags,
+    home_dir, local_engine, positional, resolve_project, service_or_local, store,
 };
 use tiered_memory::{LayeredDirStore, ProjectInfo, ProjectInput, UserDb};
 
@@ -46,9 +46,23 @@ pub(crate) fn init() -> Result<(), String> {
 fn register_current_project(args: &[String], user: &str, cwd: &Path) -> Result<String, String> {
     let (detected_name, detected_desc) = detect_project(cwd);
     let name = arg_value(args, "--name").unwrap_or(detected_name.clone());
-    let descriptor = arg_value(args, "--descriptor")
-        .or_else(|| (!detected_desc.is_empty()).then_some(detected_desc.clone()))
-        .unwrap_or_else(|| name.clone());
+    let tags = arg_values(args, "--tag");
+    let components = arg_values(args, "--component");
+    // descriptor: explicit wins; otherwise what was detected, enriched with
+    // the declared tags/components so similar-project matching sees them
+    let extras = tags
+        .iter()
+        .chain(components.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let descriptor = match arg_value(args, "--descriptor") {
+        Some(d) => d,
+        None if !detected_desc.is_empty() && extras.is_empty() => detected_desc.clone(),
+        None if !detected_desc.is_empty() => format!("{detected_desc} {extras}"),
+        None if extras.is_empty() => name.clone(),
+        None => format!("{name} {extras}"),
+    };
     let project_id = match arg_value(args, "--id") {
         Some(id) => id,
         None => slugify(&name),
@@ -59,12 +73,27 @@ fn register_current_project(args: &[String], user: &str, cwd: &Path) -> Result<S
         ));
     }
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "user": user,
         "project_id": project_id,
         "name": name,
         "descriptor": descriptor,
     });
+    if !tags.is_empty() {
+        body["tags"] = serde_json::Value::Array(
+            tags.iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect(),
+        );
+    }
+    if !components.is_empty() {
+        body["components"] = serde_json::Value::Array(
+            components
+                .iter()
+                .map(|c| serde_json::Value::String(c.clone()))
+                .collect(),
+        );
+    }
     let via = service_or_local(
         "/v1/projects",
         &body,
@@ -75,8 +104,8 @@ fn register_current_project(args: &[String], user: &str, cwd: &Path) -> Result<S
                     user: user.to_string(),
                     project_id: project_id.clone(),
                     name: Some(name.clone()),
-                    tags: vec![],
-                    components: vec![],
+                    tags: tags.clone(),
+                    components: components.clone(),
                     descriptor: Some(descriptor.clone()),
                     group: None,
                 })
@@ -88,6 +117,13 @@ fn register_current_project(args: &[String], user: &str, cwd: &Path) -> Result<S
     println!("registered `{project_id}` via {via}");
     if project_id != detected_name {
         println!("  ({detected_name} → {project_id})");
+    }
+    if !components.is_empty() {
+        println!(
+            "  components: {} — init the sibling repo(s) (e.g. the other of \
+             backend/frontend) with the same --group to share the warm (L2) tier",
+            components.join(", ")
+        );
     }
     println!("memory data: {}", data_root().display());
     Ok(project_id)
@@ -171,7 +207,8 @@ fn offer_group(args: &[String], user: &str, project_id: &str) -> Result<(), Stri
 /// that only group-owned memories carry (no member projects yet). The
 /// reserved `none` confirmation is not a group and never appears.
 fn groups_with_members(db: &UserDb) -> Vec<(String, Vec<String>)> {
-    let mut map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut map: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (id, p) in &db.projects {
         if let Some(g) = p.group.as_deref().filter(|g| *g != tiered_memory::NO_GROUP) {
             map.entry(g.to_string()).or_default().push(id.clone());
@@ -262,7 +299,11 @@ fn new_group_flow(user: &str, db: &UserDb, project_id: &str) -> Option<String> {
         std::io::stdout().flush().map_err(|e| e.to_string()).ok()?;
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line).ok()?;
-        for token in line.split([',', ' ', ';']).map(str::trim).filter(|t| !t.is_empty()) {
+        for token in line
+            .split([',', ' ', ';'])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             let picked = match token.parse::<usize>() {
                 Ok(i) => others.get(i.checked_sub(1)?).map(|s| s.as_str()),
                 Err(_) => others
@@ -583,7 +624,7 @@ pub(crate) fn select() -> Result<(), String> {
     if n == 0 || n > ids.len() {
         return Err(format!("out of range: {n}"));
     }
-    set_selection(&user, &ids[n - 1])
+    set_selection(&user, ids[n - 1])
 }
 
 fn set_selection(user: &str, id: &str) -> Result<(), String> {
@@ -697,7 +738,10 @@ fn near_miss_guard(user: &str, name: &str) -> Result<(), String> {
     let Some(db) = store()?.load(user).map_err(|e| e.to_string())? else {
         return Ok(());
     };
-    let existing: Vec<String> = groups_with_members(&db).into_iter().map(|(g, _)| g).collect();
+    let existing: Vec<String> = groups_with_members(&db)
+        .into_iter()
+        .map(|(g, _)| g)
+        .collect();
     if existing.iter().any(|g| g == name) {
         return Ok(()); // joining an existing group — nothing to guard
     }
@@ -876,11 +920,7 @@ pub(crate) fn use_cmd() -> Result<(), String> {
         |out| {
             println!(
                 "`{project}` {} `{target}`",
-                if remove {
-                    "no longer uses"
-                } else {
-                    "now uses"
-                }
+                if remove { "no longer uses" } else { "now uses" }
             );
             print_uses_from(&out["uses"], &project, remove, &target);
             Ok(())
@@ -897,11 +937,7 @@ pub(crate) fn use_cmd() -> Result<(), String> {
             };
             println!(
                 "`{project}` {} `{target}` (local store, no service running)",
-                if remove {
-                    "no longer uses"
-                } else {
-                    "now uses"
-                }
+                if remove { "no longer uses" } else { "now uses" }
             );
             print_uses(&info.uses, &project, verb, &target);
             Ok(())
@@ -918,7 +954,12 @@ fn print_uses_from(v: &serde_json::Value, project: &str, remove: bool, target: &
                 .collect()
         })
         .unwrap_or_default();
-    print_uses(&uses, project, if remove { "remove" } else { "add" }, target);
+    print_uses(
+        &uses,
+        project,
+        if remove { "remove" } else { "add" },
+        target,
+    );
 }
 
 /// The trailing context every `use` mutation prints: what the project draws
@@ -955,11 +996,7 @@ fn use_show(user: &str, project: &str) -> Result<(), String> {
     } else {
         println!("`{project}` uses (their L1+L2 surface here in the warm tier):");
         for id in &p.uses {
-            let name = db
-                .projects
-                .get(id)
-                .map(|t| t.name.as_str())
-                .unwrap_or(id);
+            let name = db.projects.get(id).map(|t| t.name.as_str()).unwrap_or(id);
             if name.is_empty() || name == id {
                 println!("  - {id}");
             } else {
@@ -978,7 +1015,11 @@ fn use_show(user: &str, project: &str) -> Result<(), String> {
     } else {
         println!(
             "used by: {} — their recall and params see `{project}`'s L1+L2",
-            used_by.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            used_by
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())

@@ -176,5 +176,5 @@ Everything lives under `TM_DATA_DIR` (default `~/tiered-memory`):
 as `groups/<group>/<topic>.md` (with hand-editable `groups.txt` and
 `similar-projects.txt`; records of groupless projects land in
 `ungrouped/<topic>.md`) — and `cache/L3/memories.md`. Human-readable mirrors
-are regenerated on every write. Pinned memories survive eviction; TTLs expire
+are regenerated whenever the underlying records change. Pinned memories survive eviction; TTLs expire
 on consolidation.

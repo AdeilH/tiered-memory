@@ -29,8 +29,10 @@ fn engine_at(
     clock: &Clock,
     tune: impl FnOnce(&mut EngineConfig),
 ) -> MemoryEngine {
-    let mut cfg = EngineConfig::default();
-    cfg.now = clock.now_fn();
+    let mut cfg = EngineConfig {
+        now: clock.now_fn(),
+        ..EngineConfig::default()
+    };
     tune(&mut cfg);
     let store = Arc::new(JsonFileStore::new(dir).unwrap());
     let embedder = tiered_memory::EmbedderConfig::Hashing { dims: 512 }
@@ -444,7 +446,11 @@ fn used_projects_share_l1_and_l2_memories() {
     let params = e.adjusted_parameters(U, Some("projB")).unwrap();
     let diff = params.iter().find(|s| s.key == "difficulty").unwrap();
     assert_eq!(diff.value, ParamValue::Number(0.2));
-    assert_eq!(diff.source, Level::L2, "borrowed params come from warm tier");
+    assert_eq!(
+        diff.source,
+        Level::L2,
+        "borrowed params come from warm tier"
+    );
 
     // …but projB's own L1 still beats the borrowed one (nearest layer wins)
     feedback(&e, "difficulty", ParamValue::Number(0.8), Some("projB"));
@@ -605,7 +611,10 @@ fn uses_links_survive_re_registration_and_removal() {
         .into_iter()
         .find(|p| p.project_id == "projB")
         .unwrap();
-    assert!(info.uses.is_empty(), "links to removed projects are dropped");
+    assert!(
+        info.uses.is_empty(),
+        "links to removed projects are dropped"
+    );
 }
 
 #[test]
@@ -616,8 +625,10 @@ fn topics_are_normalized_and_filed_into_per_topic_docs() {
     let embedder = tiered_memory::EmbedderConfig::Hashing { dims: 512 }
         .build()
         .unwrap();
-    let mut cfg = EngineConfig::default();
-    cfg.now = clock.now_fn();
+    let cfg = EngineConfig {
+        now: clock.now_fn(),
+        ..EngineConfig::default()
+    };
     let e = MemoryEngine::new(store, embedder, cfg);
 
     e.register_project(ProjectInput {
@@ -831,11 +842,14 @@ fn switching_embedder_requires_reindex() {
     let embedder256 = tiered_memory::EmbedderConfig::Hashing { dims: 256 }
         .build()
         .unwrap();
-    let e256 = MemoryEngine::new(store256, embedder256, {
-        let mut c = EngineConfig::default();
-        c.now = clock.now_fn();
-        c
-    });
+    let e256 = MemoryEngine::new(
+        store256,
+        embedder256,
+        EngineConfig {
+            now: clock.now_fn(),
+            ..EngineConfig::default()
+        },
+    );
     e256.reindex(U).unwrap();
     let out = recall(&e256, "likes worked examples", Some("projA"));
     assert!(out.hits.iter().any(|h| h.text.contains("worked")));
@@ -845,11 +859,14 @@ fn switching_embedder_requires_reindex() {
     let embedder = tiered_memory::EmbedderConfig::Hashing { dims: 512 }
         .build()
         .unwrap();
-    let fresh = MemoryEngine::new(store, embedder, {
-        let mut c = EngineConfig::default();
-        c.now = clock.now_fn();
-        c
-    });
+    let fresh = MemoryEngine::new(
+        store,
+        embedder,
+        EngineConfig {
+            now: clock.now_fn(),
+            ..EngineConfig::default()
+        },
+    );
     let res = fresh.recall(RecallInput {
         user: U.into(),
         query: "anything".into(),

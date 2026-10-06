@@ -1,10 +1,22 @@
 # HTTP API reference
 
 All bodies are JSON. Errors are `{"error": "..."}` with 400 (invalid input),
-404 (unknown user/memory/project), 409 (embedder fingerprint mismatch —
-reindex), 500 (storage/embedder failure).
+401 (missing/invalid bearer token), 404 (unknown user/memory/project), 409
+(embedder fingerprint mismatch — reindex), 500 (storage/embedder failure).
+
+**Auth** — off by default. `tiered-memory auth on` writes a token to
+`{data}/token`; every request must then carry
+`Authorization: Bearer <token>` (401 otherwise). Sized for a personal
+standalone binary on loopback, not multi-tenant serving.
 
 ---
+
+## `GET /`
+
+The browser dashboard — a self-contained HTML page (no external assets, works
+offline) with layer gauges, projects and L2 groups. First paint from a
+server-injected snapshot, then polls `/v1/stats` + `/v1/projects` every 3 s.
+Read-only; `?user=<name>` selects a non-default user.
 
 ## `GET /v1/health`
 

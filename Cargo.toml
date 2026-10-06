@@ -18,10 +18,12 @@ path = "src/bin/tiered-memory/main.rs"
 required-features = ["server"]
 
 [features]
-default = ["server"]
+# `local` (MiniLM in-process) is the default embedder; a plain
+# `cargo build` produces the full binary. `--no-default-features` drops
+# everything for a pure library build (embedder falls back to hashing).
+default = ["server", "local"]
 # HTTP JSON API (axum) + CLI service access (ureq) + interactive TUIs (crossterm
 # + ratatui console).
-# Disable with --no-default-features for a pure library build.
 server = ["dep:axum", "dep:tokio", "dep:ureq", "dep:crossterm", "dep:getrandom", "dep:ratatui"]
 # Embedded local embedding model (candle + ONNX-free safetensors, runs in-process on CPU).
 local = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]

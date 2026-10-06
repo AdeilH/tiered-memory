@@ -320,9 +320,7 @@ async fn group_rename_endpoint_moves_and_merges() {
 
     let (_, projects) = call(router.clone(), "GET", "/v1/projects/adeel", None).await;
     let projects = projects.as_array().unwrap();
-    assert!(projects
-        .iter()
-        .all(|p| p["group"].as_str() != Some("g1")));
+    assert!(projects.iter().all(|p| p["group"].as_str() != Some("g1")));
     assert_eq!(
         projects
             .iter()

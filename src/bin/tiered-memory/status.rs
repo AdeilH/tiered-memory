@@ -6,7 +6,7 @@ use crate::{
     api_get, arg_switch, arg_value, cmd_args, current_selection, data_root, default_user, store,
     Api,
 };
-use tiered_memory::{LlmConfig, NO_GROUP, DEFAULT_BIND};
+use tiered_memory::{LlmConfig, DEFAULT_BIND, NO_GROUP};
 
 pub(crate) fn status_cmd() -> Result<(), String> {
     let args = cmd_args();
@@ -80,7 +80,9 @@ pub(crate) fn status_cmd() -> Result<(), String> {
     }
     match LlmConfig::resolve(None, &data_root()).map_err(|e| e.to_string())? {
         Some(cfg) => println!("llm:       configured ({})", cfg.model),
-        None => println!("llm:       not configured — `tiered-memory credentials` (needed for `sync`)"),
+        None => {
+            println!("llm:       not configured — `tiered-memory credentials` (needed for `sync`)")
+        }
     }
 
     if set_up {

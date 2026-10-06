@@ -324,7 +324,7 @@ fn session_end(args: &[String], user: &str) -> Result<(), String> {
             if plan.entries.is_empty() {
                 return Ok(());
             }
-            match crate::memory::apply_plan(&engine, &user, &project, &plan) {
+            match crate::memory::apply_plan(&engine, user, &project, &plan) {
                 Ok(report) => eprintln!(
                     "tiered-memory hook: synced {} memories into `{project}`",
                     report.stored.len()

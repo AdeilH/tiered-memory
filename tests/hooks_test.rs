@@ -43,7 +43,7 @@ fn user_harnesses_extend_the_registry() {
     assert_eq!(mine.label, "CommandCode");
     assert_eq!(mine.target, ".commandcode/skills");
     assert!(!mine.project_scoped);
-    assert!(mine.detected(&home) == false);
+    assert!(!mine.detected(&home));
 
     // built-ins still present alongside
     assert!(reg.iter().any(|h| h.id == "agents"));

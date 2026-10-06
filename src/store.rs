@@ -11,9 +11,10 @@
 use crate::error::{MemoryError, Result};
 use crate::types::{Level, MemoryKind, MemoryRecord, ProjectInfo, UserDb};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 /// Pluggable persistence backend. The engine only ever talks to a user-keyed
 /// load/save API, so backends can range from files to SQLite to a network service.
@@ -113,7 +114,9 @@ impl MemoryStore for JsonFileStore {
 
     fn save(&self, user: &str, db: &UserDb) -> Result<()> {
         let path = self.path_for(user)?;
-        atomic_write(&path, &serde_json::to_vec_pretty(db)?)?;
+        // compact: one user file carries every embedding vector — pretty
+        // printing would inflate it several-fold for no human benefit
+        atomic_write(&path, &serde_json::to_vec(db)?)?;
         Ok(())
     }
 
@@ -137,33 +140,49 @@ impl MemoryStore for JsonFileStore {
 // LayeredDirStore — the cache hierarchy as directories
 // ---------------------------------------------------------------------------
 
-    /// Layout (root defaults to `~/tiered-memory`):
-    ///
-    /// ```text
-    /// {root}/                              ← user `local` (the standalone default)
-    ///   meta.json                          store version + embedder fingerprint
-    ///   current-project                    CLI selection marker (project id)
-    ///   projects/<project-id>.json         project descriptors
-    ///   cache/
-    ///     uses.txt                         project → project memory sources (hand-editable)
-    ///     L1/<project-id>/memories.json    hot, project-scoped records (machine)
-    ///     L1/<project-id>/memories.md      …human-readable mirror
-    ///     L2/memories.json                 related-scope records (flat machine store)
-    ///     L2/groups/<group>/<topic>.md     human-readable docs per group + topic
-    ///     L2/ungrouped/<topic>.md          …for projects without a group
-    ///     L2/groups.txt                    project → group membership (hand-editable)
-    ///     L2/similar-projects.txt          project similarity links (hand-editable)
-    ///     L3/memories.json|md              user-level traits common to all projects
-    ///   users/<other-user>/…                additional users (server mode)
-    /// ```
-    ///
-    /// The JSON files are authoritative (ids, vectors, timestamps are not
-    /// human-editable); the `.md` files are regenerated mirrors — read, grep and
-    /// diff them, but edit through the API/CLI. The relationship files are the
-    /// exception: hand-added lines in `similar-projects.txt` and `uses.txt`
-    /// survive automatic recomputation (`groups.txt` wins on load outright).
+/// Layout (root defaults to `~/tiered-memory`):
+///
+/// ```text
+/// {root}/                              ← user `local` (the standalone default)
+///   meta.json                          store version + embedder fingerprint
+///   current-project                    CLI selection marker (project id)
+///   projects/<project-id>.json         project descriptors
+///   cache/
+///     uses.txt                         project → project memory sources (hand-editable)
+///     L1/<project-id>/memories.json    hot, project-scoped records (machine)
+///     L1/<project-id>/memories.md      …human-readable mirror
+///     L2/memories.json                 related-scope records (flat machine store)
+///     L2/groups/<group>/<topic>.md     human-readable docs per group + topic
+///     L2/ungrouped/<topic>.md          …for projects without a group
+///     L2/groups.txt                    project → group membership (hand-editable)
+///     L2/similar-projects.txt          project similarity links (hand-editable)
+///     L3/memories.json|md              user-level traits common to all projects
+///   users/<other-user>/…                additional users (server mode)
+/// ```
+///
+/// The JSON files are authoritative (ids, vectors, timestamps are not
+/// human-editable); the `.md` files are regenerated mirrors — read, grep and
+/// diff them, but edit through the API/CLI. The relationship files are the
+/// exception: hand-added lines in `similar-projects.txt` and `uses.txt`
+/// survive automatic recomputation (`groups.txt` wins on load outright).
 pub struct LayeredDirStore {
     root: PathBuf,
+    /// Bytes this instance last wrote per path. Most saves touch one layer of
+    /// one project, but `save` regenerates every section — the cache lets
+    /// unchanged files skip the write entirely instead of churning the disk on
+    /// every remember/recall.
+    written: WrittenCache,
+}
+
+/// In-memory record of the last bytes written per path. Mirrors are rendered
+/// deterministically from record content (no wall-clock stamps), so "bytes
+/// unchanged" reliably means "file already correct on disk".
+type WrittenCache = Mutex<HashMap<PathBuf, Vec<u8>>>;
+
+fn lock_written(cache: &WrittenCache) -> MutexGuard<'_, HashMap<PathBuf, Vec<u8>>> {
+    // a panicked writer must not brick persistence — the cache is an
+    // optimization, so recover it and carry on
+    cache.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -178,7 +197,10 @@ impl LayeredDirStore {
         let root = root.into();
         fs::create_dir_all(&root)
             .map_err(|e| MemoryError::Storage(format!("cannot create {}: {e}", root.display())))?;
-        Ok(LayeredDirStore { root })
+        Ok(LayeredDirStore {
+            root,
+            written: WrittenCache::default(),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -248,7 +270,11 @@ impl LayeredDirStore {
         }
     }
 
+    /// JSON + MD pair for one layer folder. The JSON is compact — records
+    /// carry full embedding vectors (hundreds of floats each) and the file is
+    /// machine-authoritative; the MD mirror beside it is for human eyes.
     fn write_records(
+        &self,
         dir: &Path,
         title: &str,
         embedder: &str,
@@ -256,11 +282,13 @@ impl LayeredDirStore {
     ) -> Result<()> {
         fs::create_dir_all(dir)
             .map_err(|e| MemoryError::Storage(format!("create {}: {e}", dir.display())))?;
-        atomic_write(
+        atomic_write_cached(
+            &self.written,
             &dir.join("memories.json"),
-            &serde_json::to_vec_pretty(records)?,
+            &serde_json::to_vec(records)?,
         )?;
-        atomic_write(
+        atomic_write_cached(
+            &self.written,
             &dir.join("memories.md"),
             render_md(title, embedder, records).as_bytes(),
         )?;
@@ -269,12 +297,13 @@ impl LayeredDirStore {
 
     /// JSON-only write (used for L2, whose human-readable layer lives in the
     /// per-group, per-topic MD files instead of one `memories.md`).
-    fn write_json(dir: &Path, records: &[&MemoryRecord]) -> Result<()> {
+    fn write_json(&self, dir: &Path, records: &[&MemoryRecord]) -> Result<()> {
         fs::create_dir_all(dir)
             .map_err(|e| MemoryError::Storage(format!("create {}: {e}", dir.display())))?;
-        atomic_write(
+        atomic_write_cached(
+            &self.written,
             &dir.join("memories.json"),
-            &serde_json::to_vec_pretty(records)?,
+            &serde_json::to_vec(records)?,
         )?;
         Ok(())
     }
@@ -282,7 +311,7 @@ impl LayeredDirStore {
     // -- per-section writers (used by save) -----------------------------------
 
     /// `projects/<id>.json` descriptors: write current, drop stale files.
-    fn write_project_registry(user_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_project_registry(&self, user_dir: &Path, db: &UserDb) -> Result<()> {
         let projects_dir = user_dir.join("projects");
         fs::create_dir_all(&projects_dir)
             .map_err(|e| MemoryError::Storage(format!("create projects dir: {e}")))?;
@@ -292,7 +321,8 @@ impl LayeredDirStore {
                     "project id `{id}` is not path-safe"
                 )));
             }
-            atomic_write(
+            atomic_write_cached(
+                &self.written,
                 &projects_dir.join(format!("{id}.json")),
                 &serde_json::to_vec_pretty(info)?,
             )?;
@@ -311,7 +341,7 @@ impl LayeredDirStore {
 
     /// L1: one folder per registered/used project; directories of removed
     /// projects are reconciled away.
-    fn write_l1_layer(user_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_l1_layer(&self, user_dir: &Path, db: &UserDb) -> Result<()> {
         let mut by_project: BTreeMap<String, Vec<&MemoryRecord>> = BTreeMap::new();
         for r in db.records.iter().filter(|r| r.level == Level::L1) {
             if let Some(pid) = &r.project_id {
@@ -340,7 +370,7 @@ impl LayeredDirStore {
                 Some(p) if !p.name.is_empty() => format!("L1 · {} ({id})", p.name),
                 _ => format!("L1 · {id}"),
             };
-            Self::write_records(&dir, &title, &db.embedder, records)?;
+            self.write_records(&dir, &title, &db.embedder, records)?;
         }
         for entry in fs::read_dir(&l1_root)?.flatten() {
             let path = entry.path();
@@ -362,17 +392,17 @@ impl LayeredDirStore {
     /// records of groupless projects land in `ungrouped/<topic>.md` so every
     /// L2 record is rendered exactly once) — and the hand-editable
     /// `groups.txt` membership file (it wins on load).
-    fn write_l2_layer(user_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_l2_layer(&self, user_dir: &Path, db: &UserDb) -> Result<()> {
         let l2_dir = Self::layer_dir(user_dir, Level::L2);
         let l2: Vec<&MemoryRecord> = db.records.iter().filter(|r| r.level == Level::L2).collect();
-        Self::write_json(&l2_dir, &l2)?;
-        Self::write_l2_docs(&l2_dir, db, &l2)?;
-        Self::write_groups_file(&l2_dir, db)?;
+        self.write_json(&l2_dir, &l2)?;
+        self.write_l2_docs(&l2_dir, db, &l2)?;
+        self.write_groups_file(&l2_dir, db)?;
         Ok(())
     }
 
     /// Bucket L2 records by (group, topic) and regenerate the MD mirrors.
-    fn write_l2_docs(l2_dir: &Path, db: &UserDb, l2: &[&MemoryRecord]) -> Result<()> {
+    fn write_l2_docs(&self, l2_dir: &Path, db: &UserDb, l2: &[&MemoryRecord]) -> Result<()> {
         let mut buckets: BTreeMap<Option<String>, BTreeMap<String, Vec<&MemoryRecord>>> =
             BTreeMap::new();
         for r in l2 {
@@ -401,7 +431,8 @@ impl LayeredDirStore {
                 .map_err(|e| MemoryError::Storage(format!("create {}: {e}", dir.display())))?;
             for (topic, records) in topics {
                 let title = format!("L2 · {scope} · {topic}");
-                atomic_write(
+                atomic_write_cached(
+                    &self.written,
                     &dir.join(format!("{topic}.md")),
                     render_md(&title, &db.embedder, records).as_bytes(),
                 )?;
@@ -442,7 +473,7 @@ impl LayeredDirStore {
     /// that aren't registered (yet). For registered projects the db is
     /// authoritative here — clear an assignment with `none`, not by deleting
     /// the line (that just falls back to the project JSON).
-    fn write_groups_file(l2_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_groups_file(&self, l2_dir: &Path, db: &UserDb) -> Result<()> {
         let groups_path = l2_dir.join("groups.txt");
         let known: HashSet<&str> = db.projects.keys().map(|s| s.as_str()).collect();
         let mut entries: BTreeMap<String, String> = db
@@ -450,7 +481,7 @@ impl LayeredDirStore {
             .iter()
             .filter_map(|(id, p)| p.group.clone().map(|g| (id.clone(), g)))
             .collect();
-        for (pid, g) in read_groups_file(&groups_path)? {
+        for (pid, g) in read_pair_file(&groups_path, false, false)? {
             if !known.contains(pid.as_str()) {
                 entries.entry(pid).or_insert(g);
             }
@@ -463,14 +494,14 @@ impl LayeredDirStore {
         for (pid, g) in &entries {
             text.push_str(&format!("{pid} {g}\n"));
         }
-        atomic_write(&groups_path, text.as_bytes())?;
+        atomic_write_cached(&self.written, &groups_path, text.as_bytes())?;
         Ok(())
     }
 
     /// L3: global traits, one JSON + MD pair.
-    fn write_l3_layer(user_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_l3_layer(&self, user_dir: &Path, db: &UserDb) -> Result<()> {
         let l3: Vec<&MemoryRecord> = db.records.iter().filter(|r| r.level == Level::L3).collect();
-        Self::write_records(
+        self.write_records(
             &Self::layer_dir(user_dir, Level::L3),
             "L3 · learner traits (all projects)",
             &db.embedder,
@@ -479,9 +510,9 @@ impl LayeredDirStore {
     }
 
     /// `similar-projects.txt`: existing hand-edits ∪ computed links.
-    fn write_similar_links(user_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_similar_links(&self, user_dir: &Path, db: &UserDb) -> Result<()> {
         let link_path = Self::layer_dir(user_dir, Level::L2).join("similar-projects.txt");
-        let mut pairs = read_link_file(&link_path)?;
+        let mut pairs = read_pair_file(&link_path, true, true)?;
         for p in db.projects.values() {
             for other in &p.similar {
                 let mut pair = [p.project_id.clone(), other.clone()];
@@ -502,7 +533,7 @@ impl LayeredDirStore {
         for (a, b) in &pairs {
             text.push_str(&format!("{a} {b}\n"));
         }
-        atomic_write(&link_path, text.as_bytes())?;
+        atomic_write_cached(&self.written, &link_path, text.as_bytes())?;
         Ok(())
     }
 
@@ -510,7 +541,7 @@ impl LayeredDirStore {
     /// directional. Current links ∪ hand-added lines whose using-project is
     /// not registered (yet); for registered projects the db is authoritative
     /// and the CLI (`tiered-memory use --remove`) is how links are removed.
-    fn write_uses_file(user_dir: &Path, db: &UserDb) -> Result<()> {
+    fn write_uses_file(&self, user_dir: &Path, db: &UserDb) -> Result<()> {
         let uses_path = user_dir.join("cache").join("uses.txt");
         let known: HashSet<&str> = db.projects.keys().map(|s| s.as_str()).collect();
         let mut entries: BTreeMap<String, BTreeSet<String>> = db
@@ -519,7 +550,7 @@ impl LayeredDirStore {
             .filter(|(_, p)| !p.uses.is_empty())
             .map(|(id, p)| (id.clone(), p.uses.iter().cloned().collect()))
             .collect();
-        for (using, used) in read_uses_file(&uses_path)? {
+        for (using, used) in read_pair_file(&uses_path, false, true)? {
             if !known.contains(using.as_str()) {
                 entries.entry(using).or_default().insert(used);
             }
@@ -535,7 +566,7 @@ impl LayeredDirStore {
                 text.push_str(&format!("{using} {used}\n"));
             }
         }
-        atomic_write(&uses_path, text.as_bytes())?;
+        atomic_write_cached(&self.written, &uses_path, text.as_bytes())?;
         Ok(())
     }
 
@@ -618,7 +649,7 @@ impl LayeredDirStore {
     /// known side and activate once that project registers.
     fn merge_similar_links(user_dir: &Path, db: &mut UserDb) -> Result<()> {
         let path = Self::layer_dir(user_dir, Level::L2).join("similar-projects.txt");
-        for (a, b) in read_link_file(&path)? {
+        for (a, b) in read_pair_file(&path, true, true)? {
             attach_similar(db, &a, &b);
             attach_similar(db, &b, &a);
         }
@@ -686,7 +717,8 @@ impl MemoryStore for LayeredDirStore {
         fs::create_dir_all(user_dir.join("cache"))
             .map_err(|e| MemoryError::Storage(format!("create cache dir: {e}")))?;
 
-        atomic_write(
+        atomic_write_cached(
+            &self.written,
             &self.meta_path(user)?,
             &serde_json::to_vec_pretty(&Meta {
                 version: db.version,
@@ -694,12 +726,12 @@ impl MemoryStore for LayeredDirStore {
                 dims: db.dims,
             })?,
         )?;
-        Self::write_project_registry(&user_dir, db)?;
-        Self::write_l1_layer(&user_dir, db)?;
-        Self::write_l2_layer(&user_dir, db)?;
-        Self::write_l3_layer(&user_dir, db)?;
-        Self::write_similar_links(&user_dir, db)?;
-        Self::write_uses_file(&user_dir, db)?;
+        self.write_project_registry(&user_dir, db)?;
+        self.write_l1_layer(&user_dir, db)?;
+        self.write_l2_layer(&user_dir, db)?;
+        self.write_l3_layer(&user_dir, db)?;
+        self.write_similar_links(&user_dir, db)?;
+        self.write_uses_file(&user_dir, db)?;
         Ok(())
     }
 
@@ -737,7 +769,17 @@ fn skeleton_project(project_id: &str) -> ProjectInfo {
     }
 }
 
-fn read_link_file(path: &Path) -> Result<Vec<(String, String)>> {
+/// Parse a `<a> <b>` line file (comments with `#`, blank lines skipped; both
+/// tokens must be valid path segments). The three relationship files share
+/// this shape and differ only in pair semantics:
+///
+/// * `similar-projects.txt` — symmetric: pairs canonically sorted, self-pairs
+///   meaningless → `(canonical, skip_self)`
+/// * `groups.txt` — `<project> <group>` in order, self-pairs allowed
+/// * `uses.txt` — directional, self-pairs meaningless
+///
+/// The result is sorted + deduped so callers merge stably.
+fn read_pair_file(path: &Path, canonical: bool, skip_self: bool) -> Result<Vec<(String, String)>> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -758,12 +800,15 @@ fn read_link_file(path: &Path) -> Result<Vec<(String, String)>> {
         let (Some(a), Some(b)) = (tokens.next(), tokens.next()) else {
             continue;
         };
-        if !valid_path_segment(a) || !valid_path_segment(b) || a == b {
+        if !valid_path_segment(a) || !valid_path_segment(b) {
             continue;
         }
-        let mut pair = [a.to_string(), b.to_string()];
-        pair.sort();
-        pairs.push((pair[0].clone(), pair[1].clone()));
+        let (a, b) = (a.to_string(), b.to_string());
+        if skip_self && a == b {
+            continue;
+        }
+        let pair = if canonical && b < a { (b, a) } else { (a, b) };
+        pairs.push(pair);
     }
     pairs.sort();
     pairs.dedup();
@@ -799,78 +844,24 @@ fn attach_similar(db: &mut UserDb, project: &str, other: &str) {
 }
 
 fn read_groups_file(path: &Path) -> Result<Vec<(String, String)>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(MemoryError::Storage(format!(
-                "read {}: {e}",
-                path.display()
-            )))
-        }
-    };
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut tokens = line.split_whitespace();
-        let (Some(pid), Some(g)) = (tokens.next(), tokens.next()) else {
-            continue;
-        };
-        // `none` is a meaningful value (explicit no-group confirmation)
-        if !valid_path_segment(pid) || !valid_path_segment(g) {
-            continue;
-        }
-        out.push((pid.to_string(), g.to_string()));
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    read_pair_file(path, false, false)
 }
 
 /// `cache/uses.txt` reader — `<using> <used>` directional pairs; self-pairs
 /// and malformed ids are skipped. Sorted + deduped like the other link files.
 fn read_uses_file(path: &Path) -> Result<Vec<(String, String)>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(MemoryError::Storage(format!(
-                "read {}: {e}",
-                path.display()
-            )))
-        }
-    };
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut tokens = line.split_whitespace();
-        let (Some(using), Some(used)) = (tokens.next(), tokens.next()) else {
-            continue;
-        };
-        if !valid_path_segment(using) || !valid_path_segment(used) || using == used {
-            continue;
-        }
-        out.push((using.to_string(), used.to_string()));
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    read_pair_file(path, false, true)
 }
 
-/// Human-readable mirror of one layer's records. Regenerated on every write —
-/// the JSON beside it is the machine-authoritative copy.
+/// Human-readable mirror of one layer's records. Regenerated from record
+/// content only — no wall-clock stamps — so the bytes (and the file's mtime)
+/// change exactly when the memories change; a save that touches nothing else
+/// leaves the mirror alone.
 fn render_md(title: &str, embedder: &str, records: &[&MemoryRecord]) -> String {
     let mut out = format!(
-        "# {title}\n\n> {} memories · embedder `{}` · regenerated {}\n",
+        "# {title}\n\n> {} memories · embedder `{}`\n",
         records.len(),
         embedder,
-        fmt_utc(crate::engine::system_now_ms()),
     );
     if records.is_empty() {
         out.push_str("\n_(empty)_\n");
@@ -936,6 +927,18 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|e| MemoryError::Storage(format!("write {}: {e}", tmp.display())))?;
     fs::rename(&tmp, path)
         .map_err(|e| MemoryError::Storage(format!("rename into {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// [`atomic_write`] gated by the store's last-written cache: when the bytes
+/// match what this instance wrote last, the file on disk is already exact —
+/// skip the serialize-to-disk churn.
+fn atomic_write_cached(cache: &WrittenCache, path: &Path, bytes: &[u8]) -> Result<()> {
+    if lock_written(cache).get(path).is_some_and(|b| b == bytes) {
+        return Ok(());
+    }
+    atomic_write(path, bytes)?;
+    lock_written(cache).insert(path.to_path_buf(), bytes.to_vec());
     Ok(())
 }
 
@@ -1272,7 +1275,10 @@ mod tests {
         store.save(LOCAL_USER, &loaded).unwrap();
         let text = fs::read_to_string(&path2).unwrap();
         assert!(text.lines().any(|l| l == "b a"), "{text}");
-        assert!(text.lines().any(|l| l == "c d"), "hand edits survive: {text}");
+        assert!(
+            text.lines().any(|l| l == "c d"),
+            "hand edits survive: {text}"
+        );
 
         // a project registered with the link keeps it across save + load
         let mut db = loaded;

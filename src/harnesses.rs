@@ -694,8 +694,11 @@ pub fn pick_harnesses(home: &Path, cwd: &Path) -> Result<Option<Vec<&'static Har
         })
         .map(String::from)
         .collect();
-    let mut selected: Vec<bool> =
-        detected.iter().zip(&installed).map(|(&d, &i)| d && !i).collect();
+    let mut selected: Vec<bool> = detected
+        .iter()
+        .zip(&installed)
+        .map(|(&d, &i)| d && !i)
+        .collect();
     let mut cursor = 0usize;
     let mut start = 0usize; // first visible row of the scrolling window
     let mut redraw = true;
@@ -714,7 +717,11 @@ pub fn pick_harnesses(home: &Path, cwd: &Path) -> Result<Option<Vec<&'static Har
         let cols = width() as usize;
         // keep the status column visible on narrow terminals by squeezing the
         // label column first; rows are trimmed again below either way
-        let status_w = statuses.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+        let status_w = statuses
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0);
         let label_w = items
             .iter()
             .map(|h| h.label.chars().count())
@@ -760,7 +767,10 @@ pub fn pick_harnesses(home: &Path, cwd: &Path) -> Result<Option<Vec<&'static Har
             } else {
                 // truncate to the column first, then pad for alignment —
                 // `{:<…}` alone only pads
-                trunc(&format!("{:<label_w$}", trunc(h.label, label_w as u16)), room as u16)
+                trunc(
+                    &format!("{:<label_w$}", trunc(h.label, label_w as u16)),
+                    room as u16,
+                )
             };
             let mut room = room.saturating_sub(label.chars().count());
             let status = &statuses[i];
